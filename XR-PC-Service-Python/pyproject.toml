@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xrbt-service"
+version = "0.1.0"
+description = "Cross-platform pure-Python replacement for XRoboToolkit PC Service"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "XRoboToolkit contributors" }]
+dependencies = [
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "protobuf>=4.25",
+]
+
+[project.optional-dependencies]
+# v2 media plane (not used by v1 service, reserved here so the dependency
+# story is documented):
+#   av              -> PyAV for H.264 encode/decode
+#   aiortc          -> WebRTC signaling + media
+#   opencv-python   -> frame capture helpers
+media = ["av>=11", "aiortc>=1.9", "opencv-python>=4.8"]
+dev = ["pytest>=7", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+xrbt-service = "xrbt_service.main:run"
+
+[tool.setuptools.packages.find]
+include = ["xrbt_service*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

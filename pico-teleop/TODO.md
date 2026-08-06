@@ -1,0 +1,4 @@
+- tune parameters and make it more smooth
+    - for example, servo snaps into place right now, add relative control instead of resetting the first time. 
+    - add support for directly 6DoF EE tracking instead of having to do IK then do joint tracking (since realman has this)
+    - tune the hyperparameters for control frequency of arm

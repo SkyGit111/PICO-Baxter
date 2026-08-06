@@ -1,0 +1,69 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Native build products
+*.so
+*.o
+*.a
+build/
+dist/
+install/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+conda-env/
+
+# ROS and catkin
+devel/
+log/
+logs/
+.catkin_tools/
+*.bag
+*.bag.active
+*.db3
+
+# Runtime files
+*.log
+*.pid
+*.tmp
+*.swp
+*~
+
+# Secrets and machine-local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+
+# Recordings and large artifacts
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Machine-specific configuration
+config/local/
+config/local_*.yaml
+config/local_*.yml

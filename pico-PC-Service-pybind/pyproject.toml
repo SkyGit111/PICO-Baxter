@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xrobotoolkit_sdk"
+version = "2.0.0"
+description = "Pure-Python client for XRoboToolkit PC Service (drop-in replacement for the pybind11 xrobotoolkit_sdk)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "XRoboToolkit"},
+]
+dependencies = [
+    "grpcio>=1.50",
+    "protobuf>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["xrobotoolkit_sdk*"]
