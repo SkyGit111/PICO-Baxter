@@ -13,10 +13,20 @@ from typing import Optional
 
 try:
     from .gst_pipeline import GstPipeline, PipelineConfig
-    from .remote_vision_protocol import frame_video_buffer
+    from .remote_vision_protocol import (
+        CameraRequest,
+        frame_video_buffer,
+        parse_camera_request,
+        read_control_message,
+    )
 except ImportError:  # Permit direct execution: python vision/d455_rgb_sender.py
     from gst_pipeline import GstPipeline, PipelineConfig
-    from remote_vision_protocol import frame_video_buffer
+    from remote_vision_protocol import (
+        CameraRequest,
+        frame_video_buffer,
+        parse_camera_request,
+        read_control_message,
+    )
 
 
 LOG = logging.getLogger("d455-vision")
@@ -31,8 +41,21 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Stable D455 RGB V4L2 path, preferably /dev/v4l/by-id/...",
     )
-    parser.add_argument("--pico-ip", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("direct", "listen"),
+        default="direct",
+        help="Directly connect to PICO, or accept Remote Vision control requests",
+    )
+    parser.add_argument("--pico-ip", default="")
     parser.add_argument("--pico-port", type=int, default=12345)
+    parser.add_argument("--listen-host", default="0.0.0.0")
+    parser.add_argument("--listen-port", type=int, default=13579)
+    parser.add_argument(
+        "--allow-target-ip-mismatch",
+        action="store_true",
+        help="Allow OPEN_CAMERA to send video to an IP other than the control peer",
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
@@ -66,6 +89,7 @@ class DirectVideoSender:
         send_timeout: float,
         reconnect_delay: float,
         send_buffer_bytes: int,
+        manage_pipeline: bool = True,
     ) -> None:
         self.pipeline = pipeline
         self.host = host
@@ -74,6 +98,7 @@ class DirectVideoSender:
         self.send_timeout = send_timeout
         self.reconnect_delay = reconnect_delay
         self.send_buffer_bytes = send_buffer_bytes
+        self.manage_pipeline = manage_pipeline
         self.stop_event = threading.Event()
         self._socket: Optional[socket.socket] = None
         self.frames_sent = 0
@@ -86,8 +111,9 @@ class DirectVideoSender:
         self._close_socket()
 
     def run(self) -> None:
-        self.pipeline.start()
-        LOG.info("GStreamer capture and encoder started")
+        if self.manage_pipeline:
+            self.pipeline.start()
+            LOG.info("GStreamer capture and encoder started")
         try:
             while not self.stop_event.is_set():
                 sock = self._connect()
@@ -102,7 +128,8 @@ class DirectVideoSender:
                 finally:
                     self._close_socket()
         finally:
-            self.pipeline.stop()
+            if self.manage_pipeline:
+                self.pipeline.stop()
 
     def _connect(self) -> Optional[socket.socket]:
         LOG.info("connecting to PICO video receiver %s:%d", self.host, self.port)
@@ -183,10 +210,254 @@ class DirectVideoSender:
                 pass
 
 
+def resolve_video_target(
+    request: CameraRequest,
+    control_peer_ip: str,
+    allow_target_ip_mismatch: bool,
+) -> tuple[str, int]:
+    """Choose a safe video target for an OPEN_CAMERA request."""
+    requested_ip = request.ip.strip()
+    target_ip = requested_ip or control_peer_ip
+    if target_ip != control_peer_ip and not allow_target_ip_mismatch:
+        raise ValueError(
+            "OPEN_CAMERA target IP %s differs from control peer %s"
+            % (target_ip, control_peer_ip)
+        )
+    return target_ip, request.port
+
+
+class RemoteVisionListener:
+    """Handle PICO Remote Vision control requests on TCP port 13579."""
+
+    def __init__(
+        self,
+        pipeline: GstPipeline,
+        listen_host: str,
+        listen_port: int,
+        connect_timeout: float,
+        send_timeout: float,
+        reconnect_delay: float,
+        send_buffer_bytes: int,
+        allow_target_ip_mismatch: bool = False,
+        sender_factory=DirectVideoSender,
+    ) -> None:
+        self.pipeline = pipeline
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self.connect_timeout = connect_timeout
+        self.send_timeout = send_timeout
+        self.reconnect_delay = reconnect_delay
+        self.send_buffer_bytes = send_buffer_bytes
+        self.allow_target_ip_mismatch = allow_target_ip_mismatch
+        self.sender_factory = sender_factory
+
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
+        self.bound_port: Optional[int] = None
+        self._listen_socket: Optional[socket.socket] = None
+        self._control_socket: Optional[socket.socket] = None
+        self._video_sender: Optional[DirectVideoSender] = None
+        self._video_thread: Optional[threading.Thread] = None
+        self._stream_lock = threading.RLock()
+
+    def run(self) -> None:
+        self.pipeline.start()
+        LOG.info("GStreamer capture and encoder started")
+        try:
+            self._open_listener()
+            while not self.stop_event.is_set():
+                try:
+                    control, address = self._listen_socket.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.stop_event.is_set():
+                        break
+                    raise
+
+                LOG.info("Remote Vision control connection from %s:%d", *address)
+                self._control_socket = control
+                control.settimeout(0.5)
+                try:
+                    self._handle_control_connection(control, address[0])
+                finally:
+                    self._stop_video_stream()
+                    self._close_control_socket()
+        finally:
+            self.ready_event.set()
+            self._stop_video_stream()
+            self._close_control_socket()
+            self._close_listen_socket()
+            self.pipeline.stop()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self._close_control_socket()
+        self._close_listen_socket()
+        self._stop_video_stream()
+
+    def _open_listener(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((self.listen_host, self.listen_port))
+        listener.listen(1)
+        listener.settimeout(0.5)
+        self._listen_socket = listener
+        self.bound_port = int(listener.getsockname()[1])
+        self.ready_event.set()
+        LOG.info(
+            "Remote Vision control listener ready on %s:%d",
+            self.listen_host,
+            self.bound_port,
+        )
+
+    def _handle_control_connection(
+        self, control: socket.socket, control_peer_ip: str
+    ) -> None:
+        while not self.stop_event.is_set():
+            try:
+                message = read_control_message(control)
+            except socket.timeout:
+                continue
+            except EOFError:
+                LOG.info("Remote Vision control peer disconnected")
+                return
+            except OSError:
+                if not self.stop_event.is_set():
+                    LOG.info("Remote Vision control socket closed")
+                return
+            except ValueError as exc:
+                LOG.warning("invalid Remote Vision control message: %s", exc)
+                return
+
+            LOG.info("Remote Vision command: %s", message.command)
+            if message.command == "OPEN_CAMERA":
+                try:
+                    request = parse_camera_request(message.data)
+                    target = resolve_video_target(
+                        request,
+                        control_peer_ip,
+                        self.allow_target_ip_mismatch,
+                    )
+                except ValueError as exc:
+                    LOG.warning("OPEN_CAMERA rejected: %s", exc)
+                    continue
+                self._log_request_compatibility(request)
+                self._start_video_stream(*target)
+            elif message.command == "CLOSE_CAMERA":
+                self._stop_video_stream()
+            else:
+                LOG.warning("ignoring unknown Remote Vision command %r", message.command)
+
+    def _log_request_compatibility(self, request: CameraRequest) -> None:
+        output_width = self.pipeline.config.width * 2
+        output_height = self.pipeline.config.height
+        output_fps = self.pipeline.config.fps
+        LOG.info(
+            "OPEN_CAMERA requested camera=%r %dx%d@%d bitrate=%d render=%d "
+            "target=%s:%d; configured output=%dx%d@%d",
+            request.camera,
+            request.width,
+            request.height,
+            request.fps,
+            request.bitrate,
+            request.render_mode,
+            request.ip or "<control-peer>",
+            request.port,
+            output_width,
+            output_height,
+            output_fps,
+        )
+        if (request.width, request.height, request.fps) != (
+            output_width,
+            output_height,
+            output_fps,
+        ):
+            LOG.warning(
+                "PICO request differs from the fixed SBS output; "
+                "the configured %dx%d@%d stream will be sent",
+                output_width,
+                output_height,
+                output_fps,
+            )
+
+    def _start_video_stream(self, host: str, port: int) -> None:
+        with self._stream_lock:
+            self._stop_video_stream()
+            sender = self.sender_factory(
+                pipeline=self.pipeline,
+                host=host,
+                port=port,
+                connect_timeout=self.connect_timeout,
+                send_timeout=self.send_timeout,
+                reconnect_delay=self.reconnect_delay,
+                send_buffer_bytes=self.send_buffer_bytes,
+                manage_pipeline=False,
+            )
+            thread = threading.Thread(
+                target=self._run_video_sender,
+                args=(sender,),
+                name="RemoteVisionVideo",
+                daemon=True,
+            )
+            self._video_sender = sender
+            self._video_thread = thread
+            thread.start()
+
+    @staticmethod
+    def _run_video_sender(sender: DirectVideoSender) -> None:
+        try:
+            sender.run()
+        except Exception:
+            LOG.exception("Remote Vision video worker failed")
+
+    def _stop_video_stream(self) -> None:
+        with self._stream_lock:
+            sender = self._video_sender
+            thread = self._video_thread
+            self._video_sender = None
+            self._video_thread = None
+            if sender is not None:
+                sender.stop()
+            if thread is not None and thread is not threading.current_thread():
+                join_timeout = max(3.0, self.connect_timeout + 1.0)
+                thread.join(timeout=join_timeout)
+                if thread.is_alive():
+                    raise RuntimeError(
+                        "video worker did not stop within %.1f seconds" % join_timeout
+                    )
+
+    def _close_control_socket(self) -> None:
+        control = self._control_socket
+        self._control_socket = None
+        if control is not None:
+            try:
+                control.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                control.close()
+            except OSError:
+                pass
+
+    def _close_listen_socket(self) -> None:
+        listener = self._listen_socket
+        self._listen_socket = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+
 def main() -> int:
     args = parse_args()
+    if args.mode == "direct" and not args.pico_ip:
+        raise ValueError("--pico-ip is required in direct mode")
     if not 1 <= args.pico_port <= 65535:
         raise ValueError("--pico-port must be between 1 and 65535")
+    if not 1 <= args.listen_port <= 65535:
+        raise ValueError("--listen-port must be between 1 and 65535")
     if args.bitrate_mbps <= 0:
         raise ValueError("--bitrate-mbps must be positive")
     if args.connect_timeout <= 0 or args.send_timeout <= 0:
@@ -210,39 +481,58 @@ def main() -> int:
         test_source=args.test_source,
     )
     config.validate()
-    sender = DirectVideoSender(
-        pipeline=GstPipeline(config),
-        host=args.pico_ip,
-        port=args.pico_port,
-        connect_timeout=args.connect_timeout,
-        send_timeout=args.send_timeout,
-        reconnect_delay=args.reconnect_delay,
-        send_buffer_bytes=args.send_buffer_kib * 1024,
-    )
+    pipeline = GstPipeline(config)
+    if args.mode == "direct":
+        service = DirectVideoSender(
+            pipeline=pipeline,
+            host=args.pico_ip,
+            port=args.pico_port,
+            connect_timeout=args.connect_timeout,
+            send_timeout=args.send_timeout,
+            reconnect_delay=args.reconnect_delay,
+            send_buffer_bytes=args.send_buffer_kib * 1024,
+        )
+    else:
+        service = RemoteVisionListener(
+            pipeline=pipeline,
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
+            connect_timeout=args.connect_timeout,
+            send_timeout=args.send_timeout,
+            reconnect_delay=args.reconnect_delay,
+            send_buffer_bytes=args.send_buffer_kib * 1024,
+            allow_target_ip_mismatch=args.allow_target_ip_mismatch,
+        )
 
     def request_stop(_signum: int, _frame: object) -> None:
         LOG.info("shutdown requested")
-        sender.stop()
+        service.stop()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
     LOG.info(
-        "input=%s %dx%d@%d; output=%dx%d SBS; target=%s:%d",
+        "input=%s %dx%d@%d; output=%dx%d SBS; mode=%s",
         "videotestsrc" if args.test_source else args.device,
         args.width,
         args.height,
         args.fps,
         args.width * 2,
         args.height,
-        args.pico_ip,
-        args.pico_port,
+        args.mode,
     )
+    if args.mode == "direct":
+        LOG.info("direct video target=%s:%d", args.pico_ip, args.pico_port)
+    else:
+        LOG.info("control listener=%s:%d", args.listen_host, args.listen_port)
     try:
-        sender.run()
+        service.run()
     except KeyboardInterrupt:
-        sender.stop()
-    LOG.info("video sender stopped; sent %d access units", sender.frames_sent)
+        service.stop()
+    if isinstance(service, DirectVideoSender):
+        LOG.info("video sender stopped; sent %d access units", service.frames_sent)
+    else:
+        LOG.info("Remote Vision listener stopped")
     return 0
 
 

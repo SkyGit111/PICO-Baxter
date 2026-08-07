@@ -56,6 +56,34 @@ the next IDR instead of sending P-frames whose references were discarded.
 TCP writes have a deadline; a timed-out or partially written stream is
 discarded and reconnected rather than reused.
 
+## PICO-controlled listener mode
+
+Listener mode implements the Remote Vision `OPEN_CAMERA` / `CLOSE_CAMERA`
+control flow. It binds TCP `0.0.0.0:13579`; an `OPEN_CAMERA` request starts a
+video connection to the IP and port requested by the PICO, while
+`CLOSE_CAMERA` stops that connection. The D455 pipeline is opened exactly once
+when the process starts and remains the sole camera owner across repeated
+open/close requests.
+
+```bash
+python3 -m vision.d455_rgb_sender \
+  --mode listen \
+  --device /dev/v4l/by-id/<D455-RGB-node> \
+  --listen-host 0.0.0.0 \
+  --listen-port 13579
+```
+
+In PICO Remote Vision, enter the robot PC's LAN IP and port `13579`, then use
+the camera open/close controls. By default, an `OPEN_CAMERA` target IP must
+match the PICO control connection's peer IP. This prevents another LAN client
+from using the sender to connect to an unrelated host. If the deployed PICO
+software legitimately reports a different target IP, inspect the log first
+and then explicitly opt in with `--allow-target-ip-mismatch`.
+
+The requested width, height, FPS, bitrate, camera preset, and render mode are
+logged. This version deliberately keeps the configured 2560x720@30 SBS output
+instead of rebuilding the camera pipeline for every request.
+
 ## Local tests
 
 The protocol and pipeline-description tests do not require GStreamer or
