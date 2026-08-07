@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 
-from vision.d455_rgb_sender import RemoteVisionListener, resolve_video_target
+from vision.listener import RemoteVisionListener, resolve_video_target
 from vision.remote_vision_protocol import CAMERA_REQUEST_MAGIC, CameraRequest
 
 
@@ -19,12 +19,17 @@ class FakePipeline:
     def __init__(self):
         self.start_count = 0
         self.stop_count = 0
+        self.bus_error = None
 
     def start(self):
         self.start_count += 1
 
     def stop(self):
         self.stop_count += 1
+
+    def raise_on_bus_error(self):
+        if self.bus_error is not None:
+            raise self.bus_error
 
 
 class FakeSender:
@@ -42,6 +47,12 @@ class FakeSender:
 
     def stop(self):
         self.stop_event.set()
+
+
+class FailingSender(FakeSender):
+    def run(self):
+        self.started.set()
+        raise RuntimeError("encoder failed")
 
 
 def compact_string(value):
@@ -173,6 +184,78 @@ class ListenerStateMachineTests(unittest.TestCase):
         )
         time.sleep(0.05)
         self.assertEqual(FakeSender.instances, [])
+
+
+class ListenerFailureTests(unittest.TestCase):
+    @staticmethod
+    def start_capturing_errors(listener):
+        errors = []
+
+        def run_listener():
+            try:
+                listener.run()
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_listener)
+        thread.start()
+        return thread, errors
+
+    def test_idle_pipeline_failure_stops_listener_for_service_restart(self):
+        pipeline = FakePipeline()
+        listener = RemoteVisionListener(
+            pipeline=pipeline,
+            listen_host="127.0.0.1",
+            listen_port=0,
+            connect_timeout=0.2,
+            send_timeout=0.2,
+            reconnect_delay=0.01,
+            send_buffer_bytes=65536,
+        )
+        thread, errors = self.start_capturing_errors(listener)
+        self.assertTrue(listener.ready_event.wait(1.0))
+        pipeline.bus_error = RuntimeError("camera disconnected")
+        thread.join(timeout=2.0)
+        listener.stop()
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIn("camera disconnected", str(errors[0]))
+        self.assertEqual(pipeline.start_count, 1)
+        self.assertEqual(pipeline.stop_count, 1)
+
+    def test_video_worker_failure_is_propagated_to_control_loop(self):
+        pipeline = FakePipeline()
+        listener = RemoteVisionListener(
+            pipeline=pipeline,
+            listen_host="127.0.0.1",
+            listen_port=0,
+            connect_timeout=0.2,
+            send_timeout=0.2,
+            reconnect_delay=0.01,
+            send_buffer_bytes=65536,
+            sender_factory=FailingSender,
+        )
+        thread, errors = self.start_capturing_errors(listener)
+        self.assertTrue(listener.ready_event.wait(1.0))
+        control = socket.create_connection(
+            ("127.0.0.1", listener.bound_port), timeout=1.0
+        )
+        try:
+            control.sendall(control_frame("OPEN_CAMERA", camera_request()))
+            thread.join(timeout=2.0)
+        finally:
+            control.close()
+            listener.stop()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertIsInstance(errors[0].__cause__, RuntimeError)
+        self.assertEqual(pipeline.start_count, 1)
+        self.assertEqual(pipeline.stop_count, 1)
 
 
 if __name__ == "__main__":

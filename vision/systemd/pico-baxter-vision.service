@@ -1,0 +1,18 @@
+[Unit]
+Description=PICO-Baxter D455 Remote Vision sender
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/pico_baxter_ws/PICO-Baxter
+EnvironmentFile=%h/.config/pico-baxter/vision.env
+ExecStart=/usr/bin/python3 -m vision.d455_rgb_sender --mode listen --device ${VISION_DEVICE} --input-mode ${VISION_INPUT_MODE} --listen-host 0.0.0.0 --listen-port 13579 $VISION_EXTRA_ARGS
+Restart=on-failure
+RestartSec=2
+Nice=5
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

@@ -49,6 +49,14 @@ def frame_video_buffer(data: bytes) -> bytes:
     return struct.pack(">I", size) + data
 
 
+def read_video_buffer(sock: socket.socket) -> bytes:
+    """Read one four-byte-BE-length-framed encoded video buffer."""
+    size = struct.unpack(">I", recv_exact(sock, 4))[0]
+    if size <= 0 or size > MAX_VIDEO_BUFFER_BYTES:
+        raise ValueError("invalid video buffer length: %d" % size)
+    return recv_exact(sock, size)
+
+
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     """Read exactly *size* bytes or raise EOFError on a closed peer."""
     if size < 0:
@@ -68,6 +76,22 @@ def read_control_message(sock: socket.socket) -> ControlMessage:
     if outer_length <= 0 or outer_length > MAX_CONTROL_MESSAGE_BYTES:
         raise ValueError("invalid control message length: %d" % outer_length)
     return parse_control_body(recv_exact(sock, outer_length))
+
+
+def frame_control_message(command: str, data: bytes = b"") -> bytes:
+    """Encode one NetworkDataProtocol message including its outer frame."""
+    encoded_command = command.encode("utf-8")
+    if not encoded_command:
+        raise ValueError("control command must not be empty")
+    body = (
+        len(encoded_command).to_bytes(4, "little", signed=True)
+        + encoded_command
+        + len(data).to_bytes(4, "little", signed=True)
+        + data
+    )
+    if len(body) > MAX_CONTROL_MESSAGE_BYTES:
+        raise ValueError("control message exceeds safety limit")
+    return struct.pack(">I", len(body)) + body
 
 
 def parse_control_body(body: bytes) -> ControlMessage:
@@ -130,6 +154,32 @@ def parse_camera_request(data: bytes) -> CameraRequest:
     )
 
 
+def serialize_camera_request(request: CameraRequest) -> bytes:
+    """Encode a CameraRequest payload for the mock PICO test client."""
+    if request.width <= 0 or request.height <= 0 or request.fps <= 0:
+        raise ValueError("camera dimensions and fps must be positive")
+    if not 1 <= request.port <= 65535:
+        raise ValueError("camera target port is out of range")
+    camera = _write_compact_string(request.camera)
+    ip = _write_compact_string(request.ip)
+    return (
+        CAMERA_REQUEST_MAGIC
+        + bytes([CAMERA_REQUEST_VERSION])
+        + struct.pack(
+            "<7i",
+            request.width,
+            request.height,
+            request.fps,
+            request.bitrate,
+            request.enable_mv_hevc,
+            request.render_mode,
+            request.port,
+        )
+        + camera
+        + ip
+    )
+
+
 def _read_compact_string(data: bytes, offset: int) -> Tuple[str, int]:
     if offset >= len(data):
         raise ValueError("string length is missing")
@@ -139,3 +189,10 @@ def _read_compact_string(data: bytes, offset: int) -> Tuple[str, int]:
     if end > len(data):
         raise ValueError("string content is truncated")
     return data[offset:end].decode("utf-8", "replace"), end
+
+
+def _write_compact_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    if len(encoded) > 255:
+        raise ValueError("compact string exceeds 255 encoded bytes")
+    return bytes([len(encoded)]) + encoded

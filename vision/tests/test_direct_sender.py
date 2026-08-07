@@ -1,7 +1,7 @@
 import struct
 import unittest
 
-from vision.d455_rgb_sender import DirectVideoSender
+from vision.stream_sender import DirectVideoSender
 
 
 class FakePipeline:
@@ -27,6 +27,11 @@ class CapturingSocket:
         self.writes.append(data)
         if len(self.writes) >= self.stop_after:
             self.sender.stop_event.set()
+
+
+class FailingSocket:
+    def sendall(self, _data):
+        raise OSError("connection reset")
 
 
 class DirectSenderTests(unittest.TestCase):
@@ -67,6 +72,23 @@ class DirectSenderTests(unittest.TestCase):
         payloads = [entry[4:] for entry in sock.writes]
         self.assertEqual(payloads, [b"key1", b"delta1", b"key2"])
         self.assertEqual(sender.discontinuities, 1)
+
+    def test_connection_loss_retries_and_starts_again_at_keyframe(self):
+        frames = [
+            (b"key1", True, 0),
+            (b"delta-after-reconnect", False, 33_333_333),
+            (b"key2", True, 66_666_666),
+        ]
+        sender = self.make_sender(frames)
+        sender.manage_pipeline = False
+        second = CapturingSocket(sender, stop_after=1)
+        sockets = iter((FailingSocket(), second))
+        sender._connect = lambda: next(sockets)
+
+        sender.run()
+
+        self.assertEqual(second.writes, [struct.pack(">I", 4) + b"key2"])
+        self.assertEqual(sender.pre_keyframe_drops, 1)
 
 
 if __name__ == "__main__":

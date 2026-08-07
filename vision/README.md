@@ -16,8 +16,12 @@ sudo apt install \
   python3-gi gir1.2-gstreamer-1.0 \
   gstreamer1.0-tools gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly v4l-utils
+  gstreamer1.0-plugins-ugly gstreamer1.0-libav v4l-utils ffmpeg
 ```
+
+Or run `bash scripts/install_vision_dependencies.sh` from the repository root.
+The installation check briefly runs a synthetic pipeline through the real
+GStreamer encoder and parser; it does not require a camera or PICO.
 
 Confirm the stable RGB node before running:
 
@@ -42,7 +46,12 @@ python3 -m vision.d455_rgb_sender \
 ```
 
 The defaults are 1280x720 at 30 FPS, 2560x720 SBS output, 10 Mbps baseline
-H.264, `zerolatency`, `ultrafast`, no B frames, and a 30-frame key interval.
+H.264, `zerolatency`, `ultrafast`, no B frames, a 30-frame key interval, one
+reference frame, no lookahead, and a 100 ms VBV buffer.
+
+Raw V4L2 input is the default. Use `--input-mode mjpeg` when the selected D455
+RGB node only provides 1280x720@30 as MJPEG. `--source-format` applies only to
+raw input, for example `--source-format YUY2`.
 
 Use a synthetic source for development without a camera:
 
@@ -95,3 +104,6 @@ python3 -m unittest discover -s vision/tests -v
 
 PICO, D455, CPU-load, Wi-Fi, and glass-to-glass latency validation must be
 performed on the x86 Ubuntu robot host.
+
+Run `bash scripts/test_vision_local.sh` for the full synthetic GStreamer plus
+mock-PICO test. See [`TESTING.md`](TESTING.md) for the complete lab runbook.

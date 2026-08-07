@@ -16,6 +16,8 @@ class PipelineConfig:
     fps: int = 30
     bitrate_kbps: int = 10 * 1024
     key_interval: int = 30
+    vbv_buffer_ms: int = 100
+    input_mode: str = "raw"
     source_format: Optional[str] = None
     test_source: bool = False
 
@@ -26,26 +28,39 @@ class PipelineConfig:
             raise ValueError("width, height and fps must be positive")
         if self.bitrate_kbps <= 0 or self.key_interval <= 0:
             raise ValueError("bitrate and key interval must be positive")
+        if self.vbv_buffer_ms <= 0:
+            raise ValueError("VBV buffer duration must be positive")
+        if self.input_mode not in ("raw", "mjpeg"):
+            raise ValueError("input mode must be raw or mjpeg")
+        if self.input_mode == "mjpeg" and self.source_format:
+            raise ValueError("source format applies only to raw input mode")
 
 
 def build_pipeline_description(config: PipelineConfig) -> str:
     """Build a single-capture RGB-to-SBS low-latency H.264 pipeline."""
     config.validate()
     output_width = config.width * 2
-    input_caps = [
-        "video/x-raw",
-        "width=%d" % config.width,
-        "height=%d" % config.height,
-        "framerate=%d/1" % config.fps,
-    ]
-    if config.source_format:
-        input_caps.append("format=%s" % config.source_format)
-
     if config.test_source:
         source = "videotestsrc is-live=true pattern=smpte do-timestamp=true"
+        input_caps = [
+            "video/x-raw",
+            "width=%d" % config.width,
+            "height=%d" % config.height,
+            "framerate=%d/1" % config.fps,
+        ]
+        decoder = []
     else:
         # shlex.quote also produces a valid quoted token for Gst.parse_launch.
         source = "v4l2src device=%s do-timestamp=true" % shlex.quote(config.device)
+        input_caps = [
+            "image/jpeg" if config.input_mode == "mjpeg" else "video/x-raw",
+            "width=%d" % config.width,
+            "height=%d" % config.height,
+            "framerate=%d/1" % config.fps,
+        ]
+        if config.source_format:
+            input_caps.append("format=%s" % config.source_format)
+        decoder = ["! jpegdec"] if config.input_mode == "mjpeg" else []
 
     return " ".join(
         [
@@ -58,6 +73,8 @@ def build_pipeline_description(config: PipelineConfig) -> str:
             "! video/x-raw,format=I420",
             "! x264enc name=encoder tune=zerolatency speed-preset=ultrafast",
             "bframes=0 byte-stream=true aud=true sliced-threads=true",
+            "ref=1 rc-lookahead=0 sync-lookahead=0 vbv-buf-capacity=%d"
+            % config.vbv_buffer_ms,
             "key-int-max=%d bitrate=%d" % (config.key_interval, config.bitrate_kbps),
             "! h264parse config-interval=-1",
             "! video/x-h264,profile=baseline,stream-format=byte-stream,alignment=au",
@@ -65,6 +82,7 @@ def build_pipeline_description(config: PipelineConfig) -> str:
             "emit-signals=false enable-last-sample=false",
             source,
             "! %s" % ",".join(input_caps),
+            *decoder,
             "! videoconvert",
             "! tee name=split",
             "split. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0",
@@ -91,32 +109,38 @@ class GstPipeline:
         if not self.config.test_source and not os.path.exists(self.config.device):
             raise FileNotFoundError("camera device does not exist: %s" % self.config.device)
 
-        try:
-            import gi
-
-            gi.require_version("Gst", "1.0")
-            from gi.repository import Gst
-        except (ImportError, ValueError) as exc:
-            raise RuntimeError(
-                "GStreamer Python bindings are unavailable; install python3-gi "
-                "and the required GStreamer plugins"
-            ) from exc
-
-        Gst.init(None)
+        Gst = _load_gst()
+        _check_element_factories(Gst, self.config)
         pipeline = Gst.parse_launch(self.description)
         sink = pipeline.get_by_name("encoded_sink")
         if sink is None:
             pipeline.set_state(Gst.State.NULL)
             raise RuntimeError("GStreamer pipeline has no encoded_sink")
 
-        result = pipeline.set_state(Gst.State.PLAYING)
-        if result == Gst.StateChangeReturn.FAILURE:
+        try:
+            _set_playing_or_raise(Gst, pipeline)
+        except Exception:
             pipeline.set_state(Gst.State.NULL)
-            raise RuntimeError("GStreamer pipeline failed to enter PLAYING")
+            raise
 
         self._gst = Gst
         self._pipeline = pipeline
         self._sink = sink
+
+    def preflight(self) -> str:
+        """Briefly run the pipeline to validate plugins and negotiated caps."""
+        if not self.config.test_source and not os.path.exists(self.config.device):
+            raise FileNotFoundError("camera device does not exist: %s" % self.config.device)
+        Gst = _load_gst()
+        _check_element_factories(Gst, self.config)
+        pipeline = Gst.parse_launch(self.description)
+        try:
+            if pipeline.get_by_name("encoded_sink") is None:
+                raise RuntimeError("GStreamer pipeline has no encoded_sink")
+            _set_playing_or_raise(Gst, pipeline)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+        return Gst.version_string()
 
     def pull_access_unit(
         self, timeout_ms: int = 250
@@ -160,3 +184,74 @@ class GstPipeline:
         self._sink = None
         self._pipeline = None
         self._gst = None
+
+
+def _load_gst():
+    try:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+    except (ImportError, ValueError) as exc:
+        raise RuntimeError(
+            "GStreamer Python bindings are unavailable; install python3-gi "
+            "and the required GStreamer plugins"
+        ) from exc
+    Gst.init(None)
+    return Gst
+
+
+def required_elements(config: PipelineConfig) -> tuple[str, ...]:
+    elements = [
+        "videotestsrc" if config.test_source else "v4l2src",
+        "compositor",
+        "videoconvert",
+        "tee",
+        "queue",
+        "x264enc",
+        "h264parse",
+        "appsink",
+    ]
+    if not config.test_source and config.input_mode == "mjpeg":
+        elements.append("jpegdec")
+    return tuple(elements)
+
+
+def _check_element_factories(Gst, config: PipelineConfig) -> None:
+    missing = [
+        name
+        for name in required_elements(config)
+        if Gst.ElementFactory.find(name) is None
+    ]
+    if missing:
+        raise RuntimeError("missing GStreamer elements: %s" % ", ".join(missing))
+
+
+def _set_playing_or_raise(Gst, pipeline, timeout_seconds: int = 5) -> None:
+    result = pipeline.set_state(Gst.State.PLAYING)
+    if result == Gst.StateChangeReturn.FAILURE:
+        _raise_startup_error(Gst, pipeline, "failed to enter PLAYING")
+    if result == Gst.StateChangeReturn.ASYNC:
+        result, _current, _pending = pipeline.get_state(
+            timeout_seconds * Gst.SECOND
+        )
+        if result == Gst.StateChangeReturn.FAILURE:
+            _raise_startup_error(Gst, pipeline, "failed during startup")
+        if result == Gst.StateChangeReturn.ASYNC:
+            raise RuntimeError(
+                "GStreamer pipeline startup timed out after %d seconds"
+                % timeout_seconds
+            )
+
+
+def _raise_startup_error(Gst, pipeline, summary: str) -> None:
+    message = pipeline.get_bus().timed_pop_filtered(
+        100 * Gst.MSECOND, Gst.MessageType.ERROR
+    )
+    if message is not None:
+        error, debug = message.parse_error()
+        raise RuntimeError(
+            "GStreamer pipeline %s: %s (%s)"
+            % (summary, error, debug or "no details")
+        )
+    raise RuntimeError("GStreamer pipeline %s" % summary)
