@@ -23,12 +23,16 @@ PICO 4 Ultra
 → Baxter control bridge
 → Baxter SDK
 
-## Planned visual-feedback path
+## Visual-feedback path
 
 Intel RealSense D455 RGB
-→ low-latency H.264 sender
+→ standalone GStreamer low-latency H.264 sender
 → PICO Remote Vision
 
 The robot control path and video path remain independent processes.
+
+The initial direct sender connects to PICO TCP port `12345`, sends a
+side-by-side duplicate of the 1280x720 RGB image, and does not depend on ROS.
+See [`vision/README.md`](vision/README.md) for dependencies and usage.
 
 See `UPSTREAM_VERSIONS.md` for imported upstream versions.
