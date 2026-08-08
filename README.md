@@ -1,40 +1,48 @@
 # PICO-Baxter
 
-PICO 4 Ultra based teleoperation and visual-feedback system for the
-Baxter robot.
+本仓库用于实现基于 PICO 4 Ultra 的 Baxter 机器人遥操作与视觉反馈。
 
-## Repository structure
+## 仓库结构
 
-- `bridge/`: Baxter-side control, testing and XR bridge scripts.
-- `pico-teleop/`: Snapshot of the upstream teleoperation framework.
-- `XR-PC-Service-Python/`: Snapshot of the Python XR PC Service.
-- `pico-PC-Service-pybind/`: Snapshot of the pybind PC Service.
-- `vision/`: D455 RGB visual-feedback sender.
-- `config/`: Shared configuration.
-- `scripts/`: Startup, installation and diagnostic scripts.
-- `docs/`: Architecture and operation documentation.
+- `bridge/`：Baxter 端控制、测试和 XR 桥接脚本。
+- `pico-teleop/`：上游遥操作框架的源码快照。
+- `XR-PC-Service-Python/`：Python 版 XR PC Service 的源码快照。
+- `pico-PC-Service-pybind/`：pybind 版 PC Service 的源码快照。
+- `vision/`：独立的 D455 RGB 视觉反馈服务。
+- `config/`：共享配置。
+- `scripts/`：视觉服务的依赖安装与自动化测试脚本。
 
-## Control path
+## 机器人控制链
 
+```text
 PICO 4 Ultra
 → XR PC Service
-→ XR input source
-→ teleoperation engine
-→ Baxter control bridge
+→ SdkXRInputSource
+→ TeleopEngine
+→ Baxter bridge
 → Baxter SDK
+```
 
-## Visual-feedback path
+## 视觉反馈链
 
+```text
 Intel RealSense D455 RGB
-→ standalone GStreamer low-latency H.264 sender
+→ 独立的 GStreamer 低延迟 H.264 发送服务
 → PICO Remote Vision
+```
 
-The robot control path and video path remain independent processes.
+机器人控制链与视频链运行在不同进程中。视频服务不依赖 ROS，也不会导入或运行
+XR PC Service、Baxter SDK 或 Baxter 遥操作桥。
 
-The initial direct sender connects to PICO TCP port `12345`, sends a
-side-by-side duplicate of the 1280x720 RGB image, and does not depend on ROS.
-It also supports the PICO-controlled `OPEN_CAMERA` / `CLOSE_CAMERA` flow by
-listening on TCP port `13579`.
-See [`vision/README.md`](vision/README.md) for dependencies and usage.
+视频服务支持两种网络模式：
 
-See `UPSTREAM_VERSIONS.md` for imported upstream versions.
+- 直接连接 PICO 的 TCP `12345` 端口；
+- 监听 TCP `0.0.0.0:13579`，处理 PICO Remote Vision 的
+  `OPEN_CAMERA` / `CLOSE_CAMERA` 请求。
+
+D455 初始输入为 1280×720、30 FPS，发送前将同一 RGB 图像横向复制为
+2560×720 SBS。依赖、运行参数和测试流程参见
+[`vision/README.md`](vision/README.md) 与
+[`vision/TESTING.md`](vision/TESTING.md)。
+
+导入的上游版本记录参见 [`UPSTREAM_VERSIONS.md`](UPSTREAM_VERSIONS.md)。

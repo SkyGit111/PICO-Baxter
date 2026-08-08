@@ -1,15 +1,14 @@
-# D455 RGB sender
+# D455 RGB 视觉反馈服务
 
-This directory contains the video-feedback plane for PICO Remote Vision. It
-does not import or run the XR PC Service, ROS, the Baxter SDK, or the Baxter
-teleoperation bridge. One GStreamer pipeline owns the D455 RGB device and
-duplicates its 1280x720 image horizontally into a 2560x720 SBS frame.
+本目录实现面向 PICO Remote Vision 的独立视频链。它不会导入或运行 XR PC
+Service、ROS、Baxter SDK 或 Baxter 遥操作桥。一个 GStreamer 管线独占 D455
+RGB 设备，将 1280×720 图像横向复制为 2560×720 SBS，再进行低延迟 H.264
+编码和 TCP 发送。
 
-## Target runtime dependencies
+## 运行依赖
 
-Install the Ubuntu GStreamer runtime, Python GI bindings, V4L2 tools, and the
-x264/parser plugins. Package names vary slightly by Ubuntu release; the
-typical packages are:
+目标环境为机器人主机上的 x86 Ubuntu。需要安装 GStreamer、Python GI、V4L2
+工具、x264/H.264 插件以及 FFmpeg：
 
 ```bash
 sudo apt install \
@@ -19,96 +18,139 @@ sudo apt install \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav v4l-utils ffmpeg
 ```
 
-Or run `bash scripts/install_vision_dependencies.sh` from the repository root.
-The installation check briefly runs a synthetic pipeline through the real
-GStreamer encoder and parser; it does not require a camera or PICO.
-
-The scripts intentionally default to `/usr/bin/python3`, because Ubuntu's
-APT-installed `python3-gi` is normally unavailable inside Conda, pyenv, or a
-custom `/usr/local` Python. Override this only when the alternate interpreter
-has a working GI installation: `VISION_PYTHON=/path/to/python bash ...`.
-
-Confirm the stable RGB node before running:
+也可以在仓库根目录运行：
 
 ```bash
-v4l2-ctl --list-devices
-v4l2-ctl --device /dev/v4l/by-id/<D455-RGB-node> --list-formats-ext
+bash scripts/install_vision_dependencies.sh
 ```
 
-Do not run another RealSense or V4L2 capture process against the same D455.
+安装脚本会先运行 Python 测试，再短暂启动真实的 GStreamer 编码与解析管线，
+但使用的是合成图像，因此不需要连接 D455 或 PICO。
 
-## Direct PICO mode
+脚本有意默认使用 `/usr/bin/python3`。Ubuntu 通过 APT 安装的 `python3-gi`
+通常无法被 Conda、pyenv 或 `/usr/local` 下的自定义 Python 导入。只有在其他
+解释器已经能够正常加载 GI 时才应覆盖默认值：
 
-The initial mode connects directly to a PICO Remote Vision TCP listener. Each
-Annex-B H.264 access unit is prefixed by a four-byte unsigned big-endian
-length.
+```bash
+VISION_PYTHON=/path/to/python bash scripts/test_vision_local.sh
+```
+
+## 查找 D455 RGB 节点
+
+不要硬编码 `/dev/video0`。先列出稳定的 by-id 路径和每个节点支持的格式：
+
+```bash
+/usr/bin/python3 -m vision.diagnose --list-only
+
+for device in /dev/v4l/by-id/*video-index*; do
+  printf '\n===== %s =====\n' "$device"
+  v4l2-ctl --device "$device" --list-formats-ext
+done
+```
+
+选择提供 RGB/彩色图像、并支持 1280×720@30 的节点。优先使用 raw YUY2；如果
+只有 MJPEG 支持目标分辨率和帧率，则使用 MJPEG。不要同时运行 RealSense Viewer、
+其他 V4L2 程序或第二个视频服务来打开同一个 D455 节点。
+
+后续示例统一使用环境变量保存实际路径：
+
+```bash
+D455_DEVICE='/dev/v4l/by-id/替换为实际的D455-RGB节点'
+```
+
+## 编码和延迟策略
+
+默认参数如下：
+
+- 输入：1280×720、30 FPS；
+- 输出：2560×720 SBS；
+- 码率：10 Mbps；
+- H.264 Baseline、Annex-B、按完整 AU 输出；
+- `zerolatency`、`ultrafast`、`bframes=0`；
+- 1 个参考帧，无前向预测，100 ms VBV；
+- 关键帧间隔 30 帧；
+- 分支队列和 appsink 最多保留 1 个 buffer，旧帧及时丢弃。
+
+发送端会检测丢帧造成的时间戳断层，并暂停发送依赖帧，直到下一个 IDR。TCP
+写入设置了超时；发生超时或部分发送后会丢弃当前连接并重新建立，不会继续复用
+已经失去帧边界的字节流。
+
+每个 H.264 AU 的 TCP 格式为：
+
+```text
+[4 字节无符号大端长度][完整 Annex-B H.264 AU]
+```
+
+## 直接连接 PICO
+
+直接模式连接 PICO Remote Vision 的 TCP 视频监听端口，默认是 `12345`：
 
 ```bash
 /usr/bin/python3 -m vision.d455_rgb_sender \
-  --device /dev/v4l/by-id/<D455-RGB-node> \
+  --mode direct \
+  --device "$D455_DEVICE" \
+  --input-mode raw \
+  --source-format YUY2 \
   --pico-ip 192.168.1.50 \
-  --pico-port 12345
+  --pico-port 12345 \
+  --verbose
 ```
 
-The defaults are 1280x720 at 30 FPS, 2560x720 SBS output, 10 Mbps baseline
-H.264, `zerolatency`, `ultrafast`, no B frames, a 30-frame key interval, one
-reference frame, no lookahead, and a 100 ms VBV buffer.
-
-Raw V4L2 input is the default. Use `--input-mode mjpeg` when the selected D455
-RGB node only provides 1280x720@30 as MJPEG. `--source-format` applies only to
-raw input, for example `--source-format YUY2`.
-
-Use a synthetic source for development without a camera:
+如果 D455 节点只在 MJPEG 下支持目标模式，则去掉 `--source-format`，改用：
 
 ```bash
-/usr/bin/python3 -m vision.d455_rgb_sender --test-source --pico-ip 127.0.0.1
+--input-mode mjpeg
 ```
 
-The pipeline and appsink queues retain at most one buffer and drop older
-buffers. The sender detects timestamp gaps caused by such drops and waits for
-the next IDR instead of sending P-frames whose references were discarded.
-TCP writes have a deadline; a timed-out or partially written stream is
-discarded and reconnected rather than reused.
+没有摄像头时可以使用合成图像测试直接模式：
 
-## PICO-controlled listener mode
+```bash
+/usr/bin/python3 -m vision.d455_rgb_sender \
+  --test-source \
+  --pico-ip 127.0.0.1
+```
 
-Listener mode implements the Remote Vision `OPEN_CAMERA` / `CLOSE_CAMERA`
-control flow. It binds TCP `0.0.0.0:13579`; an `OPEN_CAMERA` request starts a
-video connection to the IP and port requested by the PICO, while
-`CLOSE_CAMERA` stops that connection. The D455 pipeline is opened exactly once
-when the process starts and remains the sole camera owner across repeated
-open/close requests.
+## PICO 控制的监听模式
+
+监听模式实现 PICO Remote Vision 的 `OPEN_CAMERA` / `CLOSE_CAMERA` 控制流。
+进程监听 TCP `0.0.0.0:13579`；收到 `OPEN_CAMERA` 后，向请求中指定的 PICO
+IP 和端口建立第二条视频 TCP 连接；收到 `CLOSE_CAMERA` 后关闭视频连接。
+
+D455 管线只在进程启动时打开一次。重复打开、关闭 Remote Vision 不会重复打开
+摄像头。
 
 ```bash
 /usr/bin/python3 -m vision.d455_rgb_sender \
   --mode listen \
-  --device /dev/v4l/by-id/<D455-RGB-node> \
+  --device "$D455_DEVICE" \
+  --input-mode raw \
+  --source-format YUY2 \
   --listen-host 0.0.0.0 \
-  --listen-port 13579
+  --listen-port 13579 \
+  --verbose
 ```
 
-In PICO Remote Vision, enter the robot PC's LAN IP and port `13579`, then use
-the camera open/close controls. By default, an `OPEN_CAMERA` target IP must
-match the PICO control connection's peer IP. This prevents another LAN client
-from using the sender to connect to an unrelated host. If the deployed PICO
-software legitimately reports a different target IP, inspect the log first
-and then explicitly opt in with `--allow-target-ip-mismatch`.
+在 PICO Remote Vision 中填写机器人主机的局域网 IP 和端口 `13579`。默认情况
+下，`OPEN_CAMERA` 声明的视频目标 IP 必须与控制连接的对端 IP 一致，防止局域网
+中的其他客户端借助本服务连接无关主机。如果实际 PICO 软件确实声明了不同 IP，
+应先保留并检查日志，再显式添加 `--allow-target-ip-mismatch`。
 
-The requested width, height, FPS, bitrate, camera preset, and render mode are
-logged. This version deliberately keeps the configured 2560x720@30 SBS output
-instead of rebuilding the camera pipeline for every request.
+PICO 请求中的宽度、高度、FPS、码率、相机预设和渲染模式会写入日志。当前版本
+始终保持配置的 2560×720@30 SBS 输出，不会根据每次请求重复构建摄像头管线。
 
-## Local tests
+## 自动化测试
 
-The protocol and pipeline-description tests do not require GStreamer or
-hardware:
+协议、状态机和管线描述测试不需要 GStreamer 或硬件：
 
 ```bash
 /usr/bin/python3 -m unittest discover -s vision/tests -v
 ```
 
-PICO, D455, CPU-load, Wi-Fi, and glass-to-glass latency validation must be
-performed on the x86 Ubuntu robot host.
+完整的合成视频端到端测试会启动真实 GStreamer 编码器和模拟 PICO：
 
-Run `bash scripts/test_vision_local.sh` for the full synthetic GStreamer plus
-mock-PICO test. See [`TESTING.md`](TESTING.md) for the complete lab runbook.
+```bash
+bash scripts/test_vision_local.sh
+```
+
+真实 PICO、D455、CPU 负载、Wi-Fi 和端到端显示延迟必须在机器人主机与实验室
+网络中验证。完整步骤参见 [`TESTING.md`](TESTING.md)。

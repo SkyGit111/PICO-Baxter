@@ -1,5 +1,5 @@
 [Unit]
-Description=PICO-Baxter D455 Remote Vision sender
+Description=PICO-Baxter D455 Remote Vision 视频发送服务
 After=network-online.target
 Wants=network-online.target
 
