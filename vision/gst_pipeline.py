@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -194,8 +195,9 @@ def _load_gst():
         from gi.repository import Gst
     except (ImportError, ValueError) as exc:
         raise RuntimeError(
-            "GStreamer Python bindings are unavailable; install python3-gi "
-            "and the required GStreamer plugins"
+            "GStreamer Python bindings are unavailable for %s; install "
+            "python3-gi and run the vision service with Ubuntu's system "
+            "interpreter (normally /usr/bin/python3)" % sys.executable
         ) from exc
     Gst.init(None)
     return Gst

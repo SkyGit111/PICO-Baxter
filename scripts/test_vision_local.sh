@@ -2,8 +2,14 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+vision_python="${VISION_PYTHON:-/usr/bin/python3}"
 test_dir="$(mktemp -d)"
 sender_pid=""
+
+if [[ ! -x "$vision_python" ]]; then
+  echo "Vision Python is not executable: $vision_python" >&2
+  exit 1
+fi
 
 cleanup() {
   if [[ -n "$sender_pid" ]] && kill -0 "$sender_pid" 2>/dev/null; then
@@ -15,10 +21,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$repo_root"
-python3 -m unittest discover -s vision/tests -v
-python3 -m vision.diagnose --test-source
+echo "Using vision Python: $vision_python"
+"$vision_python" -m unittest discover -s vision/tests -v
+"$vision_python" -m vision.diagnose --test-source
 
-python3 -m vision.d455_rgb_sender \
+"$vision_python" -m vision.d455_rgb_sender \
   --mode listen \
   --test-source \
   --listen-host 127.0.0.1 \
@@ -33,7 +40,7 @@ for _attempt in $(seq 1 50); do
     cat "$test_dir/sender.log" >&2
     exit 1
   fi
-  if python3 -c 'import socket; s=socket.create_connection(("127.0.0.1", 13579), 0.2); s.close()' 2>/dev/null; then
+  if "$vision_python" -c 'import socket; s=socket.create_connection(("127.0.0.1", 13579), 0.2); s.close()' 2>/dev/null; then
     listener_ready=1
     break
   fi
@@ -46,7 +53,7 @@ if [[ "$listener_ready" -ne 1 ]]; then
   exit 1
 fi
 
-python3 -m vision.mock_pico \
+"$vision_python" -m vision.mock_pico \
   --mode control \
   --control-host 127.0.0.1 \
   --control-port 13579 \

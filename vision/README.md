@@ -23,6 +23,11 @@ Or run `bash scripts/install_vision_dependencies.sh` from the repository root.
 The installation check briefly runs a synthetic pipeline through the real
 GStreamer encoder and parser; it does not require a camera or PICO.
 
+The scripts intentionally default to `/usr/bin/python3`, because Ubuntu's
+APT-installed `python3-gi` is normally unavailable inside Conda, pyenv, or a
+custom `/usr/local` Python. Override this only when the alternate interpreter
+has a working GI installation: `VISION_PYTHON=/path/to/python bash ...`.
+
 Confirm the stable RGB node before running:
 
 ```bash
@@ -39,7 +44,7 @@ Annex-B H.264 access unit is prefixed by a four-byte unsigned big-endian
 length.
 
 ```bash
-python3 -m vision.d455_rgb_sender \
+/usr/bin/python3 -m vision.d455_rgb_sender \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --pico-ip 192.168.1.50 \
   --pico-port 12345
@@ -56,7 +61,7 @@ raw input, for example `--source-format YUY2`.
 Use a synthetic source for development without a camera:
 
 ```bash
-python3 -m vision.d455_rgb_sender --test-source --pico-ip 127.0.0.1
+/usr/bin/python3 -m vision.d455_rgb_sender --test-source --pico-ip 127.0.0.1
 ```
 
 The pipeline and appsink queues retain at most one buffer and drop older
@@ -75,7 +80,7 @@ when the process starts and remains the sole camera owner across repeated
 open/close requests.
 
 ```bash
-python3 -m vision.d455_rgb_sender \
+/usr/bin/python3 -m vision.d455_rgb_sender \
   --mode listen \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --listen-host 0.0.0.0 \
@@ -99,7 +104,7 @@ The protocol and pipeline-description tests do not require GStreamer or
 hardware:
 
 ```bash
-python3 -m unittest discover -s vision/tests -v
+/usr/bin/python3 -m unittest discover -s vision/tests -v
 ```
 
 PICO, D455, CPU-load, Wi-Fi, and glass-to-glass latency validation must be

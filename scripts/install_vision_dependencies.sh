@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+vision_python="${VISION_PYTHON:-/usr/bin/python3}"
 
 sudo apt-get update
 sudo apt-get install -y \
@@ -17,8 +18,20 @@ sudo apt-get install -y \
   v4l-utils \
   ffmpeg
 
+if [[ ! -x "$vision_python" ]]; then
+  echo "Vision Python is not executable: $vision_python" >&2
+  echo "Override it with VISION_PYTHON=/path/to/python if required." >&2
+  exit 1
+fi
+if ! "$vision_python" -c 'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst' 2>/dev/null; then
+  echo "GStreamer GI is unavailable in $vision_python." >&2
+  echo "Ubuntu's python3-gi normally requires VISION_PYTHON=/usr/bin/python3." >&2
+  exit 1
+fi
+
 cd "$repo_root"
-python3 -m unittest discover -s vision/tests -v
-python3 -m vision.diagnose --test-source
+echo "Using vision Python: $vision_python"
+"$vision_python" -m unittest discover -s vision/tests -v
+"$vision_python" -m vision.diagnose --test-source
 
 echo "Vision dependencies and the synthetic GStreamer pipeline are ready."

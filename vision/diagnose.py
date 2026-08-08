@@ -7,6 +7,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -72,6 +73,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    print("Python interpreter:", sys.executable)
     print("Stable V4L2 device paths:")
     devices = discover_video_devices()
     if devices:

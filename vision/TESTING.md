@@ -31,7 +31,7 @@ have identical pixel MD5 values.
 ## 3. Find the D455 RGB node
 
 ```bash
-python3 -m vision.diagnose --list-only
+/usr/bin/python3 -m vision.diagnose --list-only
 v4l2-ctl --device /dev/v4l/by-id/<candidate> --list-formats-ext
 ```
 
@@ -54,7 +54,7 @@ pipeline, and then releases it. Stop any other D455 users first.
 Prefer raw YUY2 if the node supports 1280x720@30:
 
 ```bash
-python3 -m vision.diagnose \
+/usr/bin/python3 -m vision.diagnose \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --input-mode raw \
   --source-format YUY2
@@ -63,7 +63,7 @@ python3 -m vision.diagnose \
 If only MJPEG provides the required mode:
 
 ```bash
-python3 -m vision.diagnose \
+/usr/bin/python3 -m vision.diagnose \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --input-mode mjpeg
 ```
@@ -73,7 +73,7 @@ python3 -m vision.diagnose \
 Terminal A, raw example:
 
 ```bash
-python3 -m vision.d455_rgb_sender \
+/usr/bin/python3 -m vision.d455_rgb_sender \
   --mode listen \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --input-mode raw \
@@ -86,7 +86,7 @@ python3 -m vision.d455_rgb_sender \
 Terminal B:
 
 ```bash
-python3 -m vision.mock_pico \
+/usr/bin/python3 -m vision.mock_pico \
   --mode control \
   --control-host 127.0.0.1 \
   --video-listen-host 127.0.0.1 \
@@ -108,7 +108,7 @@ ffmpeg -v error -f h264 -i /tmp/d455-sbs.h264 -frames:v 1 -y /tmp/d455-sbs.png
 ## 6. Real PICO listener mode
 
 ```bash
-python3 -m vision.d455_rgb_sender \
+/usr/bin/python3 -m vision.d455_rgb_sender \
   --mode listen \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --input-mode raw \
@@ -138,7 +138,7 @@ scoped TCP rule for port 13579 according to the lab network policy.
 If the PICO exposes a plain video listener on 12345:
 
 ```bash
-python3 -m vision.d455_rgb_sender \
+/usr/bin/python3 -m vision.d455_rgb_sender \
   --mode direct \
   --device /dev/v4l/by-id/<D455-RGB-node> \
   --input-mode raw \
