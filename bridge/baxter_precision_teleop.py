@@ -11,7 +11,8 @@ verified transport, coordinate mapping and Baxter safety rules, then adds:
 - a continuous braking-aware Cartesian target servo with speed and acceleration caps;
 - the last successful joint command as the next IK user seed;
 - IK backtracking and skip-with-hold behaviour for unreachable samples;
-- Grip hysteresis, release-to-rearm and packet/robot safety stops.
+- Grip hysteresis, release-to-rearm and packet/robot safety stops;
+- zero-motion arming, fixed lock orientation, and strict first-IK continuity.
 
 Deliberate scope:
 - one arm only;
@@ -40,6 +41,7 @@ commands unless --execute is present.
 """
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -94,12 +96,36 @@ def parse_args() -> argparse.Namespace:
         default=0.0007,
         help="Moving hand deadband radius in controller metres; 0 disables.",
     )
+    parser.add_argument(
+        "--motion-start-threshold",
+        type=float,
+        default=0.003,
+        help=(
+            "Hand displacement required after Grip lock before IK motion starts. "
+            "Grip alone therefore cannot move the arm."
+        ),
+    )
 
     # Independent Cartesian servo target.  These limits apply before IK.
     parser.add_argument("--control-rate-hz", type=float, default=50.0)
+    parser.add_argument(
+        "--command-rate-hz",
+        type=float,
+        default=50.0,
+        help="Independent rate that continuously republishes the latest accepted joint command.",
+    )
     parser.add_argument("--target-time-constant", type=float, default=0.04)
     parser.add_argument("--max-ee-speed", type=float, default=0.45)
     parser.add_argument("--max-ee-accel", type=float, default=2.00)
+    parser.add_argument(
+        "--max-command-lead",
+        type=float,
+        default=0.08,
+        help=(
+            "Maximum Cartesian command lead ahead of the measured endpoint in metres; "
+            "0 disables. This does not limit total travel."
+        ),
+    )
     parser.add_argument(
         "--max-control-dt",
         type=float,
@@ -112,16 +138,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-joint-step",
         type=float,
-        default=0.0,
-        help="Maximum measured-to-command change per control cycle in radians; 0 disables.",
+        default=0.12,
+        help=(
+            "Maximum commanded joint lead from the measured angle in radians per IK update; "
+            "0 disables. This does not limit total joint travel."
+        ),
     )
     parser.add_argument(
         "--max-ik-difference",
         type=float,
         default=0.25,
-        help="Reject IK branches farther than this from current/seed joints; 0 disables.",
+        help=(
+            "Reject consecutive IK branches farther than this; 0 disables. "
+            "This is a branch-continuity test, not a total joint-motion limit."
+        ),
     )
-    parser.add_argument("--ik-backtrack-attempts", type=int, default=8)
+    parser.add_argument(
+        "--max-first-ik-difference",
+        type=float,
+        default=0.10,
+        help=(
+            "Maximum joint difference between the Grip-lock joint pose and the "
+            "first accepted IK solution; 0 disables."
+        ),
+    )
+    parser.add_argument("--ik-backtrack-attempts", type=int, default=3)
+    parser.add_argument(
+        "--ik-budget-ms",
+        type=float,
+        default=90.0,
+        help="Stop launching additional IK backtracking calls after this elapsed budget.",
+    )
+    parser.add_argument(
+        "--orientation-relax-after",
+        type=int,
+        default=3,
+        help=(
+            "After this many consecutive strict-orientation IK misses, retry "
+            "toward the measured tool orientation; 0 disables relaxation."
+        ),
+    )
+    parser.add_argument(
+        "--max-orientation-relax-deg",
+        type=float,
+        default=3.0,
+        help="Maximum temporary tool-orientation relaxation in degrees.",
+    )
 
     # Input freshness and dead-man hysteresis.
     parser.add_argument("--max-age", type=float, default=0.50)
@@ -159,14 +221,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--hand-filter-tau must be non-negative.")
     if args.hand_deadzone < 0.0:
         raise ValueError("--hand-deadzone must be non-negative.")
+    if args.motion_start_threshold < 0.0:
+        raise ValueError("--motion-start-threshold must be non-negative.")
     if args.control_rate_hz <= 0.0:
         raise ValueError("--control-rate-hz must be positive.")
+    if args.command_rate_hz <= 0.0:
+        raise ValueError("--command-rate-hz must be positive.")
     if args.target_time_constant <= 0.0:
         raise ValueError("--target-time-constant must be positive.")
     if args.max_ee_speed <= 0.0:
         raise ValueError("--max-ee-speed must be positive.")
     if args.max_ee_accel <= 0.0:
         raise ValueError("--max-ee-accel must be positive.")
+    if args.max_command_lead < 0.0:
+        raise ValueError("--max-command-lead must be non-negative.")
     if args.max_control_dt <= 0.0:
         raise ValueError("--max-control-dt must be positive.")
     if not (0.0 < args.speed_ratio <= 1.0):
@@ -175,8 +243,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-joint-step must be non-negative.")
     if args.max_ik_difference < 0.0:
         raise ValueError("--max-ik-difference must be non-negative.")
+    if args.max_first_ik_difference < 0.0:
+        raise ValueError("--max-first-ik-difference must be non-negative.")
     if args.ik_backtrack_attempts < 1:
         raise ValueError("--ik-backtrack-attempts must be at least 1.")
+    if args.ik_budget_ms <= 0.0:
+        raise ValueError("--ik-budget-ms must be positive.")
+    if args.orientation_relax_after < 0:
+        raise ValueError("--orientation-relax-after must be non-negative.")
+    if not (0.0 <= args.max_orientation_relax_deg <= 15.0):
+        raise ValueError("--max-orientation-relax-deg must be in [0, 15].")
     if args.max_age <= 0.0:
         raise ValueError("--max-age must be positive.")
     if args.connection_timeout <= 0.0:
@@ -437,10 +513,20 @@ class CartesianTargetLimiter:
 
         return list(self.position)
 
-    def accept_backtracked_position(self, accepted: Vector3) -> None:
-        """Keep the servo aligned with the Cartesian target accepted by IK."""
+    def enforce_position(self, accepted: Vector3) -> None:
+        """Apply anti-windup without discarding the current motion direction."""
         self.position = list(accepted)
-        self.velocity = [0.0, 0.0, 0.0]
+        self.velocity = clamp_vector_norm(self.velocity, self.maximum_speed)
+
+    def accept_backtracked_position(
+        self,
+        accepted: Vector3,
+        alpha: float,
+    ) -> None:
+        """Align with a reachable IK target while preserving partial continuity."""
+        self.position = list(accepted)
+        safe_alpha = max(0.0, min(1.0, alpha))
+        self.velocity = multiply(self.velocity, safe_alpha)
         self.speed_saturated = False
         self.acceleration_saturated = False
 
@@ -473,6 +559,7 @@ class CsvDiagnostics:
         "ik_diff_rad",
         "ik_code",
         "translation_saturated",
+        "command_lead_saturated",
         "speed_saturated",
         "acceleration_saturated",
     ]
@@ -620,6 +707,57 @@ class LatestPacketReceiver:
                 continue
 
             self._publish(decoded, received, None)
+class ContinuousJointCommandPublisher:
+    """Republish the latest accepted joint command independently of slow IK calls."""
+
+    def __init__(self, limb: Any, rate_hz: float) -> None:
+        self._limb = limb
+        self._period = 1.0 / rate_hz
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="baxter-joint-command-publisher",
+            daemon=True,
+        )
+        self._command: Optional[JointDict] = None
+        self._error: Optional[str] = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def set_command(self, command: JointDict) -> None:
+        with self._lock:
+            self._command = dict(command)
+
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        next_time = time.monotonic()
+        while not self._stop_event.is_set() and not rospy.is_shutdown():
+            with self._lock:
+                command = None if self._command is None else dict(self._command)
+            if command:
+                try:
+                    self._limb.set_joint_positions(command, raw=False)
+                except Exception as exc:
+                    with self._lock:
+                        self._error = "joint publisher failed: {}".format(exc)
+                    return
+
+            next_time += self._period
+            delay = next_time - time.monotonic()
+            if delay > 0.0:
+                time.sleep(delay)
+            else:
+                next_time = time.monotonic()
 
 
 def robot_is_ready(robot_enable: Any) -> Tuple[bool, str]:
@@ -668,6 +806,43 @@ def decode_result_code(response: Any) -> int:
     return int(code)
 
 
+def quaternion_distance(a: Any, b: Any) -> float:
+    """Return the shortest angular distance between two quaternions."""
+    dot = abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+    return 2.0 * math.acos(min(1.0, max(-1.0, dot)))
+
+
+def relax_orientation(reference: Any, measured: Any, max_angle: float) -> Any:
+    """Move reference toward measured by at most max_angle using quaternion SLERP."""
+    result = copy.copy(reference)
+    values_a = [reference.x, reference.y, reference.z, reference.w]
+    values_b = [measured.x, measured.y, measured.z, measured.w]
+    dot = sum(a * b for a, b in zip(values_a, values_b))
+    if dot < 0.0:
+        values_b = [-value for value in values_b]
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    distance = 2.0 * math.acos(dot)
+    if distance <= 1e-9 or max_angle <= 0.0:
+        return result
+    fraction = min(1.0, max_angle / distance)
+    if dot > 0.9995:
+        values = [
+            a + fraction * (b - a) for a, b in zip(values_a, values_b)
+        ]
+        norm = math.sqrt(sum(value * value for value in values))
+        values = [value / norm for value in values]
+    else:
+        theta = math.acos(dot)
+        scale_a = math.sin((1.0 - fraction) * theta) / math.sin(theta)
+        scale_b = math.sin(fraction * theta) / math.sin(theta)
+        values = [
+            scale_a * a + scale_b * b for a, b in zip(values_a, values_b)
+        ]
+    result.x, result.y, result.z, result.w = values
+    return result
+
+
 def solve_ik(
     service: Any,
     target: PoseStamped,
@@ -714,12 +889,17 @@ def solve_ik_with_backtracking(
     desired_position: Vector3,
     seed_angles: Optional[JointDict],
     attempts: int,
+    budget_ms: float,
 ) -> Tuple[bool, JointDict, int, Optional[PoseStamped], float]:
-    """Try 1.0, 0.5, 0.25, ... of the requested Cartesian step."""
+    """Try a small number of local Cartesian targets within a time budget."""
     direction = subtract(desired_position, current_position)
     last_code = 0
+    started = time.monotonic()
 
     for attempt in range(attempts):
+        if attempt > 0 and (time.monotonic() - started) * 1000.0 >= budget_ms:
+            break
+
         alpha = 0.5 ** attempt
         partial_position = add(current_position, multiply(direction, alpha))
         target = create_target_pose(partial_position, current_orientation)
@@ -729,20 +909,13 @@ def solve_ik_with_backtracking(
             seed_angles,
         )
         last_code = result_code
-
-        # Baxter 的用户种子在部分姿态下可能失败。
-        # 使用上一帧完整 IK 解优先保持连续性；
-        # 若失败，再以机器人当前关节角重新尝试同一个目标。
-        if not valid and seed_angles:
-            valid, solution, result_code = solve_ik(
-                service,
-                target,
-                None,
-            )
-            last_code = result_code
-
         if valid:
             return True, solution, result_code, target, alpha
+
+    # Do not fall back to SEED_CURRENT during an active Grip session.
+    # Baxter is kinematically redundant; a current-seed fallback can select a
+    # different elbow/wrist configuration for the same tool pose.  We prefer
+    # holding the previous command over changing IK branch.
 
     return False, {}, last_code, None, 0.0
 
@@ -803,15 +976,27 @@ def print_configuration(args: argparse.Namespace) -> None:
     print("BAXTER PRECISION TELEOP - REAL ROBOT")
     print("Arm:                    {}".format(args.side))
     print("Control rate:           {:.1f} Hz".format(args.control_rate_hz))
+    print("Command publish rate:   {:.1f} Hz".format(args.command_rate_hz))
     print("Translation scale:      {:.3f}".format(args.scale))
     print("Maximum displacement:   {:.3f} m".format(args.max_translation))
     print("Hand filter tau:        {:.3f} s".format(args.hand_filter_tau))
     print("Moving hand deadband:   {:.4f} m".format(args.hand_deadzone))
+    print("Motion start threshold: {:.4f} m".format(args.motion_start_threshold))
     print("Maximum EE speed:       {:.3f} m/s".format(args.max_ee_speed))
     print("Maximum EE acceleration:{:.3f} m/s^2".format(args.max_ee_accel))
+    print("Maximum command lead:   {:.3f} m".format(args.max_command_lead))
     print("Baxter speed ratio:     {:.3f}".format(args.speed_ratio))
-    print("Maximum joint step:     {:.4f} rad/cycle".format(args.max_joint_step))
+    print("Maximum joint lead:     {:.4f} rad".format(args.max_joint_step))
     print("IK branch threshold:    {:.3f} rad".format(args.max_ik_difference))
+    print("First IK threshold:     {:.3f} rad".format(args.max_first_ik_difference))
+    print("IK backtrack attempts:  {}".format(args.ik_backtrack_attempts))
+    print("IK time budget:         {:.1f} ms".format(args.ik_budget_ms))
+    print(
+        "Orientation relaxation: after {} misses, up to {:.1f} deg".format(
+            args.orientation_relax_after,
+            args.max_orientation_relax_deg,
+        )
+    )
     print("Mapping:                [-PICO z, -PICO x, +PICO y]")
     print("Rotation:               DISABLED")
     print("Gripper:                NOT COMMANDED")
@@ -859,6 +1044,10 @@ def main() -> None:
         args.target_time_constant,
     )
     diagnostics = CsvDiagnostics(args.csv_log)
+    command_publisher = ContinuousJointCommandPublisher(
+        limb,
+        args.command_rate_hz,
+    )
 
     locked = False
     rearm_blocked = False
@@ -868,6 +1057,9 @@ def main() -> None:
     controller_reference: Optional[Vector3] = None
     raw_controller_reference: Optional[Vector3] = None
     robot_position_reference: Optional[Vector3] = None
+    robot_orientation_reference: Optional[Any] = None
+    motion_active = False
+    first_ik_pending = False
     latest_raw_controller: Optional[Vector3] = None
     latest_controller: Optional[Vector3] = None
     latest_grip = 0.0
@@ -881,6 +1073,7 @@ def main() -> None:
     last_control_time: Optional[float] = None
     last_status_time = 0.0
     last_safety_report_time = 0.0
+    consecutive_ik_misses = 0
     # 完整的上一帧 IK 解：用于下一帧 SEED_USER 和分支连续性判断。
     last_successful_joint_command: Optional[JointDict] = None
 
@@ -903,23 +1096,39 @@ def main() -> None:
         nonlocal controller_reference
         nonlocal raw_controller_reference
         nonlocal robot_position_reference
+        nonlocal robot_orientation_reference
+        nonlocal motion_active
+        nonlocal first_ik_pending
         nonlocal last_control_time
         nonlocal last_successful_joint_command
         nonlocal last_sent_joint_command
         nonlocal last_accepted_cartesian_position
+        nonlocal consecutive_ik_misses
 
         was_locked = locked
         if was_locked:
-            hold_current_position(limb)
+            try:
+                current_hold = {
+                    name: float(value)
+                    for name, value in limb.joint_angles().items()
+                }
+                if current_hold:
+                    command_publisher.set_command(current_hold)
+            except Exception as exc:
+                rospy.logerr("Failed to update hold command: %s", exc)
 
         locked = False
         controller_reference = None
         raw_controller_reference = None
         robot_position_reference = None
+        robot_orientation_reference = None
+        motion_active = False
+        first_ik_pending = False
         last_control_time = None
         last_successful_joint_command = None
         last_sent_joint_command = None
         last_accepted_cartesian_position = None
+        consecutive_ik_misses = 0
         target_limiter.reset()
         moving_deadband.reset()
 
@@ -932,10 +1141,7 @@ def main() -> None:
     def keep_previous_command() -> None:
         if last_sent_joint_command:
             try:
-                limb.set_joint_positions(
-                    last_sent_joint_command,
-                    raw=False,
-                )
+                command_publisher.set_command(last_sent_joint_command)
             except Exception as exc:
                 clear_reference(
                     "failed to hold previous command: {}".format(exc),
@@ -949,7 +1155,8 @@ def main() -> None:
         """
         if last_accepted_cartesian_position is not None:
             target_limiter.accept_backtracked_position(
-                last_accepted_cartesian_position
+                last_accepted_cartesian_position,
+                0.0,
             )
 
     print("Precision teleop ready on UDP {}:{}.".format(args.bind_host, args.port))
@@ -962,10 +1169,16 @@ def main() -> None:
     try:
         limb.set_joint_position_speed(args.speed_ratio)
         receiver.start()
+        command_publisher.start()
 
         while not rospy.is_shutdown():
             now = time.monotonic()
             snapshot = receiver.snapshot()
+
+            publisher_error = command_publisher.error()
+            if publisher_error is not None:
+                clear_reference(publisher_error, safety_stop=True)
+                break
 
             if snapshot.serial != last_snapshot_serial:
                 last_snapshot_serial = snapshot.serial
@@ -1106,11 +1319,22 @@ def main() -> None:
                     else list(latest_controller)
                 )
                 robot_position_reference = endpoint_position(endpoint)
+                # Translation-only teleoperation must preserve the tool
+                # orientation captured at Grip lock.  Using the measured
+                # orientation every frame turns accidental drift into the next
+                # target and allows a self-reinforcing wrist/elbow twist.
+                robot_orientation_reference = copy.copy(endpoint["orientation"])
                 target_limiter.reset(robot_position_reference)
-                # 第一帧不设置用户种子，先由 Baxter 使用当前关节角求解。
-                # 第一帧成功后，才保存完整 IK 解供后续连续求解。
-                last_successful_joint_command = None
+
+                # Seed the very first IK call with the exact Grip-lock joint
+                # state.  A redundant 7-DoF arm can otherwise choose another
+                # joint configuration for the same Cartesian pose.
+                last_successful_joint_command = dict(current_angles)
                 last_sent_joint_command = dict(current_angles)
+                command_publisher.set_command(current_angles)
+                motion_active = False
+                first_ik_pending = True
+                consecutive_ik_misses = 0
                 last_accepted_cartesian_position = list(
                     robot_position_reference
                 )
@@ -1142,6 +1366,7 @@ def main() -> None:
             assert controller_reference is not None
             assert raw_controller_reference is not None
             assert robot_position_reference is not None
+            assert robot_orientation_reference is not None
 
             if last_control_time is None:
                 control_dt = 1.0 / args.control_rate_hz
@@ -1159,6 +1384,22 @@ def main() -> None:
                 raw_controller_reference,
             )
             hand_delta = subtract(stable_controller, controller_reference)
+
+            # Grip is a clutch, not a motion command.  Until the controller has
+            # moved beyond a small arming threshold, hold the exact Grip-lock
+            # joint pose and do not call IK at all.
+            if not motion_active:
+                if vector_norm(hand_delta) < args.motion_start_threshold:
+                    command_publisher.set_command(last_sent_joint_command or {})
+                    target_limiter.reset(robot_position_reference)
+                    rate.sleep()
+                    continue
+                motion_active = True
+                print(
+                    "[MOTION] hand displacement {:.4f} m; IK motion enabled"
+                    .format(vector_norm(hand_delta))
+                )
+
             unclamped_robot_delta = map_pico_to_baxter(
                 hand_delta,
                 args.scale,
@@ -1183,7 +1424,52 @@ def main() -> None:
 
             endpoint_now = limb.endpoint_pose()
             current_endpoint_position = endpoint_position(endpoint_now)
-            current_endpoint_orientation = endpoint_now["orientation"]
+            # Keep the Grip-lock orientation normally.  Near a workspace
+            # boundary, repeated misses may temporarily soften that constraint
+            # by a few degrees toward the measured pose.  This never changes
+            # the stored reference and never enables a different IK seed.
+            target_endpoint_orientation = robot_orientation_reference
+            orientation_relaxation = 0.0
+            if (
+                args.orientation_relax_after > 0
+                and consecutive_ik_misses >= args.orientation_relax_after
+                and args.max_orientation_relax_deg > 0.0
+            ):
+                orientation_relaxation = math.radians(
+                    args.max_orientation_relax_deg
+                )
+                target_endpoint_orientation = relax_orientation(
+                    robot_orientation_reference,
+                    endpoint_now["orientation"],
+                    orientation_relaxation,
+                )
+                orientation_relaxation = min(
+                    orientation_relaxation,
+                    quaternion_distance(
+                        robot_orientation_reference,
+                        endpoint_now["orientation"],
+                    ),
+                )
+
+            # Anti-windup: the command may move rapidly over unlimited total
+            # distance, but it may not run arbitrarily far ahead of the robot.
+            # This is a local servo lead, not a workspace limit.
+            command_lead_saturated = False
+            command_lead = subtract(
+                smooth_position,
+                current_endpoint_position,
+            )
+            if (
+                args.max_command_lead > 0.0
+                and vector_norm(command_lead) > args.max_command_lead
+            ):
+                smooth_position = add(
+                    current_endpoint_position,
+                    clamp_vector_norm(command_lead, args.max_command_lead),
+                )
+                target_limiter.enforce_position(smooth_position)
+                command_lead_saturated = True
+
             desired_lag = vector_norm(
                 subtract(desired_position, smooth_position)
             )
@@ -1202,12 +1488,14 @@ def main() -> None:
                 ) = solve_ik_with_backtracking(
                     ik_service,
                     current_endpoint_position,
-                    current_endpoint_orientation,
+                    target_endpoint_orientation,
                     smooth_position,
                     last_successful_joint_command,
                     args.ik_backtrack_attempts,
+                    args.ik_budget_ms,
                 )
             except rospy.ServiceException as exc:
+                consecutive_ik_misses += 1
                 ik_time_ms = (time.monotonic() - ik_started) * 1000.0
                 freeze_cartesian_target()
                 keep_previous_command()
@@ -1220,6 +1508,7 @@ def main() -> None:
             ik_time_ms = (time.monotonic() - ik_started) * 1000.0
 
             if not valid or accepted_target is None:
+                consecutive_ik_misses += 1
                 freeze_cartesian_target()
                 keep_previous_command()
                 if now - last_status_time >= 1.0 / args.status_rate_hz:
@@ -1232,6 +1521,8 @@ def main() -> None:
                     last_status_time = now
                 rate.sleep()
                 continue
+
+            consecutive_ik_misses = 0
 
             current_angles = {
                 name: float(value)
@@ -1256,34 +1547,40 @@ def main() -> None:
                 continue
 
             try:
-                if last_successful_joint_command is None:
-                    # 首个有效解只需要接近机器人当前构型。
-                    branch_difference = maximum_joint_difference(
-                        solution,
-                        current_angles,
-                    )
-                else:
-                    # 真正的分支连续性：
-                    # 比较相邻两帧完整 IK 解，而不是比较机器人是否追上目标。
-                    branch_difference = maximum_joint_difference(
-                        solution,
-                        last_successful_joint_command,
-                    )
+                assert last_successful_joint_command is not None
+                # Compare the new complete IK solution with the previous
+                # accepted complete IK solution.  At Grip start that previous
+                # solution is exactly the measured lock joint pose.
+                branch_difference = maximum_joint_difference(
+                    solution,
+                    last_successful_joint_command,
+                )
             except KeyError as exc:
                 clear_reference(str(exc), safety_stop=True)
                 rate.sleep()
                 continue
+
+            active_branch_limit = args.max_ik_difference
+            if first_ik_pending and args.max_first_ik_difference > 0.0:
+                if active_branch_limit <= 0.0:
+                    active_branch_limit = args.max_first_ik_difference
+                else:
+                    active_branch_limit = min(
+                        active_branch_limit,
+                        args.max_first_ik_difference,
+                    )
+
             if (
-                args.max_ik_difference > 0.0
-                and branch_difference > args.max_ik_difference
+                active_branch_limit > 0.0
+                and branch_difference > active_branch_limit
             ):
                 freeze_cartesian_target()
                 keep_previous_command()
                 if now - last_status_time >= 1.0 / args.status_rate_hz:
                     print(
-                        "[IK SKIP] consecutive IK jump {:.4f} rad "
-                        "rejected; holding"
-                        .format(branch_difference)
+                        "[IK SKIP] IK jump {:.4f} rad exceeds {:.4f}; "
+                        "holding lock branch"
+                        .format(branch_difference, active_branch_limit)
                     )
                     last_status_time = now
                 rate.sleep()
@@ -1295,7 +1592,7 @@ def main() -> None:
                     solution,
                     args.max_joint_step,
                 )
-                limb.set_joint_positions(command, raw=False)
+                command_publisher.set_command(command)
             except Exception as exc:
                 clear_reference(
                     "joint command failed: {}".format(exc),
@@ -1306,13 +1603,15 @@ def main() -> None:
 
             last_sent_joint_command = dict(command)
             last_successful_joint_command = dict(solution)
+            first_ik_pending = False
 
             accepted_position = target_pose_position(accepted_target)
             last_accepted_cartesian_position = list(accepted_position)
 
             if accepted_alpha < 1.0:
                 target_limiter.accept_backtracked_position(
-                    accepted_position
+                    accepted_position,
+                    accepted_alpha,
                 )
 
             diagnostics.write(
@@ -1341,6 +1640,7 @@ def main() -> None:
                     "ik_diff_rad": branch_difference,
                     "ik_code": result_code,
                     "translation_saturated": int(translation_saturated),
+                    "command_lead_saturated": int(command_lead_saturated),
                     "speed_saturated": int(target_limiter.speed_saturated),
                     "acceleration_saturated": int(
                         target_limiter.acceleration_saturated
@@ -1349,8 +1649,9 @@ def main() -> None:
             )
 
             if now - last_status_time >= 1.0 / args.status_rate_hz:
-                saturation_flags = "{}{}{}".format(
+                saturation_flags = "{}{}{}{}".format(
                     "T" if translation_saturated else "-",
+                    "L" if command_lead_saturated else "-",
                     "V" if target_limiter.speed_saturated else "-",
                     "A" if target_limiter.acceleration_saturated else "-",
                 )
@@ -1358,7 +1659,8 @@ def main() -> None:
                     "[MOVE] seq={} age={:.1f}ms grip={:.2f} "
                     "hand={:.3f}m cmd_delta={:.3f}m v={:.3f}m/s "
                     "lag={:.3f}m track={:.3f}m joint_err={:.3f}rad "
-                    "ik={:.1f}ms alpha={:.3f} diff={:.4f} sat={}"
+                    "ik={:.1f}ms alpha={:.3f} diff={:.4f} "
+                    "relax={:.1f}deg sat={}"
                     .format(
                         latest_sequence,
                         latest_packet_age * 1000.0,
@@ -1372,6 +1674,7 @@ def main() -> None:
                         ik_time_ms,
                         accepted_alpha,
                         branch_difference,
+                        math.degrees(orientation_relaxation),
                         saturation_flags,
                     )
                 )
@@ -1384,7 +1687,17 @@ def main() -> None:
 
     finally:
         print("Issuing hold command...")
-        hold_current_position(limb)
+        try:
+            final_hold = {
+                name: float(value)
+                for name, value in limb.joint_angles().items()
+            }
+            if final_hold:
+                command_publisher.set_command(final_hold)
+                time.sleep(0.10)
+        except Exception as exc:
+            rospy.logerr("Failed to issue final hold command: %s", exc)
+        command_publisher.close()
         try:
             limb.set_joint_position_speed(DEFAULT_BAXTER_SPEED_RATIO)
         except Exception as exc:
