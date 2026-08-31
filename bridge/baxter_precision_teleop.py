@@ -10,7 +10,7 @@ verified transport, coordinate mapping and Baxter safety rules, then adds:
 - a moving millimetre-scale hand deadband that remains active everywhere;
 - a continuous braking-aware Cartesian target servo with speed and acceleration caps;
 - the last successful joint command as the next IK user seed;
-- IK backtracking and skip-with-hold behaviour for unreachable samples;
+- asynchronous latest-only IK, backtracking and skip-with-hold behaviour;
 - Grip hysteresis, release-to-rearm and packet/robot safety stops;
 - zero-motion arming, fixed lock orientation, and strict first-IK continuity.
 
@@ -41,7 +41,6 @@ commands unless --execute is present.
 """
 
 import argparse
-import copy
 import csv
 import json
 import math
@@ -64,6 +63,24 @@ PROTOCOL_VERSION = 1
 DEFAULT_BAXTER_SPEED_RATIO = 0.30
 Vector3 = List[float]
 JointDict = Dict[str, float]
+
+
+@dataclass
+class QuaternionValue:
+    x: float
+    y: float
+    z: float
+    w: float
+
+
+def copy_quaternion(value: Any) -> QuaternionValue:
+    """Copy a Baxter/ROS quaternion into a small mutable-independent value."""
+    return QuaternionValue(
+        x=float(value.x),
+        y=float(value.y),
+        z=float(value.z),
+        w=float(value.w),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,15 +181,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ik-backtrack-attempts", type=int, default=3)
     parser.add_argument(
+        "--ik-backend",
+        choices=("ros-service", "pykdl"),
+        default="ros-service",
+        help=(
+            "IK implementation. ros-service preserves the existing Baxter "
+            "path; pykdl is an opt-in local backend that requires baxter_pykdl."
+        ),
+    )
+    parser.add_argument(
         "--ik-budget-ms",
         type=float,
         default=90.0,
         help="Stop launching additional IK backtracking calls after this elapsed budget.",
     )
     parser.add_argument(
+        "--max-ik-result-age",
+        type=float,
+        default=0.25,
+        help=(
+            "Reject an asynchronous IK result this many seconds after submission. "
+            "This bounds target staleness but cannot cancel a running ROS call."
+        ),
+    )
+    parser.add_argument(
         "--orientation-relax-after",
         type=int,
-        default=3,
+        default=0,
         help=(
             "After this many consecutive strict-orientation IK misses, retry "
             "toward the measured tool orientation; 0 disables relaxation."
@@ -249,6 +284,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--ik-backtrack-attempts must be at least 1.")
     if args.ik_budget_ms <= 0.0:
         raise ValueError("--ik-budget-ms must be positive.")
+    if args.max_ik_result_age <= 0.0:
+        raise ValueError("--max-ik-result-age must be positive.")
     if args.orientation_relax_after < 0:
         raise ValueError("--orientation-relax-after must be non-negative.")
     if not (0.0 <= args.max_orientation_relax_deg <= 15.0):
@@ -554,7 +591,12 @@ class CsvDiagnostics:
         "tracking_error_m",
         "joint_tracking_error_rad",
         "command_speed_mps",
+        "ik_backend",
         "ik_time_ms",
+        "ik_result_age_ms",
+        "ik_request_id",
+        "ik_request_seq",
+        "ik_replaced_pending",
         "ik_alpha",
         "ik_diff_rad",
         "ik_code",
@@ -814,7 +856,6 @@ def quaternion_distance(a: Any, b: Any) -> float:
 
 def relax_orientation(reference: Any, measured: Any, max_angle: float) -> Any:
     """Move reference toward measured by at most max_angle using quaternion SLERP."""
-    result = copy.copy(reference)
     values_a = [reference.x, reference.y, reference.z, reference.w]
     values_b = [measured.x, measured.y, measured.z, measured.w]
     dot = sum(a * b for a, b in zip(values_a, values_b))
@@ -824,7 +865,7 @@ def relax_orientation(reference: Any, measured: Any, max_angle: float) -> Any:
     dot = min(1.0, max(-1.0, dot))
     distance = 2.0 * math.acos(dot)
     if distance <= 1e-9 or max_angle <= 0.0:
-        return result
+        return QuaternionValue(*values_a)
     fraction = min(1.0, max_angle / distance)
     if dot > 0.9995:
         values = [
@@ -839,8 +880,7 @@ def relax_orientation(reference: Any, measured: Any, max_angle: float) -> Any:
         values = [
             scale_a * a + scale_b * b for a, b in zip(values_a, values_b)
         ]
-    result.x, result.y, result.z, result.w = values
-    return result
+    return QuaternionValue(*values)
 
 
 def solve_ik(
@@ -920,6 +960,336 @@ def solve_ik_with_backtracking(
     return False, {}, last_code, None, 0.0
 
 
+@dataclass
+class IkWorkItem:
+    request_id: int
+    session_id: int
+    sequence: int
+    submitted_monotonic: float
+    current_position: Vector3
+    current_orientation: QuaternionValue
+    desired_position: Vector3
+    seed_angles: Optional[JointDict]
+    attempts: int
+    budget_ms: float
+
+
+@dataclass
+class IkWorkResult:
+    request: IkWorkItem
+    started_monotonic: float
+    completed_monotonic: float
+    valid: bool
+    solution: JointDict
+    result_code: int
+    accepted_target: Optional[PoseStamped]
+    accepted_alpha: float
+    error: Optional[str]
+
+    @property
+    def solve_time_ms(self) -> float:
+        return (self.completed_monotonic - self.started_monotonic) * 1000.0
+
+    @property
+    def total_age_ms(self) -> float:
+        return (
+            self.completed_monotonic - self.request.submitted_monotonic
+        ) * 1000.0
+
+
+@dataclass
+class IkWorkerSnapshot:
+    in_flight: bool
+    pending_request_id: Optional[int]
+    completed_request_id: Optional[int]
+    replaced_pending: int
+
+
+class RosServiceIkBackend:
+    """Compatibility backend for Baxter's blocking PositionKinematicsNode."""
+
+    name = "ros-service"
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+
+    def solve(
+        self,
+        request: IkWorkItem,
+    ) -> Tuple[bool, JointDict, int, Optional[PoseStamped], float]:
+        return solve_ik_with_backtracking(
+            self._service,
+            request.current_position,
+            request.current_orientation,
+            request.desired_position,
+            request.seed_angles,
+            request.attempts,
+            request.budget_ms,
+        )
+
+
+class PyKdlIkBackend:
+    """Opt-in local IK backend using ``baxter_pykdl``.
+
+    The backend intentionally shares the same latest-only worker, user seed,
+    Cartesian backtracking, age rejection and main-thread continuity checks as
+    the ROS service backend.  It does not add collision checking; callers must
+    treat it as experimental until it has passed the read-only benchmark and
+    low-speed robot validation.
+    """
+
+    name = "pykdl"
+
+    def __init__(self, kinematics: Any, joint_names: List[str]) -> None:
+        if not joint_names:
+            raise ValueError("joint_names must not be empty")
+        self._kinematics = kinematics
+        self._joint_names = list(joint_names)
+
+    def solve(
+        self,
+        request: IkWorkItem,
+    ) -> Tuple[bool, JointDict, int, Optional[PoseStamped], float]:
+        direction = subtract(
+            request.desired_position,
+            request.current_position,
+        )
+        orientation = [
+            request.current_orientation.x,
+            request.current_orientation.y,
+            request.current_orientation.z,
+            request.current_orientation.w,
+        ]
+        seed_vector = None
+        if request.seed_angles:
+            if set(request.seed_angles) != set(self._joint_names):
+                raise KeyError("IK seed joint set does not match limb joints")
+            seed_vector = [
+                request.seed_angles[name] for name in self._joint_names
+            ]
+
+        started = time.monotonic()
+        for attempt in range(request.attempts):
+            if (
+                attempt > 0
+                and (time.monotonic() - started) * 1000.0
+                >= request.budget_ms
+            ):
+                break
+
+            alpha = 0.5 ** attempt
+            position = add(
+                request.current_position,
+                multiply(direction, alpha),
+            )
+            values = self._kinematics.inverse_kinematics(
+                position,
+                orientation,
+                seed_vector,
+            )
+            if values is None:
+                continue
+            values = list(values)
+            if len(values) != len(self._joint_names):
+                continue
+            solution = {
+                name: float(value)
+                for name, value in zip(self._joint_names, values)
+            }
+            if not all(math.isfinite(value) for value in solution.values()):
+                continue
+            target = create_target_pose(position, request.current_orientation)
+            return True, solution, 1, target, alpha
+
+        return False, {}, 0, None, 0.0
+
+
+class LatestOnlyIkWorker:
+    """Run at most one IK call and retain only the newest pending request.
+
+    A completed result blocks the next solve until the control thread consumes
+    it.  Consuming a result also drops the queued request, because that request
+    was built with the pre-result IK seed.  The control thread then submits a
+    fresh latest target with the newly accepted seed.
+    """
+
+    def __init__(self, backend_or_service: Any) -> None:
+        if callable(getattr(backend_or_service, "solve", None)):
+            self._backend = backend_or_service
+        else:
+            # Keep the small callable-service constructor useful for tests and
+            # for existing code while exposing a backend boundary for local IK.
+            self._backend = RosServiceIkBackend(backend_or_service)
+        self._condition = threading.Condition()
+        self._stop = False
+        self._in_flight = False
+        self._pending: Optional[IkWorkItem] = None
+        self._completed: Optional[IkWorkResult] = None
+        self._next_request_id = 1
+        self._replaced_pending = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="baxter-ik-worker",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(
+        self,
+        session_id: int,
+        sequence: int,
+        current_position: Vector3,
+        current_orientation: Any,
+        desired_position: Vector3,
+        seed_angles: Optional[JointDict],
+        attempts: int,
+        budget_ms: float,
+        submitted_monotonic: Optional[float] = None,
+    ) -> int:
+        with self._condition:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            request = IkWorkItem(
+                request_id=request_id,
+                session_id=session_id,
+                sequence=sequence,
+                submitted_monotonic=(
+                    time.monotonic()
+                    if submitted_monotonic is None
+                    else submitted_monotonic
+                ),
+                current_position=list(current_position),
+                current_orientation=copy_quaternion(current_orientation),
+                desired_position=list(desired_position),
+                seed_angles=(
+                    None if seed_angles is None else dict(seed_angles)
+                ),
+                attempts=attempts,
+                budget_ms=budget_ms,
+            )
+            if self._pending is not None:
+                self._replaced_pending += 1
+            self._pending = request
+            self._condition.notify_all()
+            return request_id
+
+    def poll_result(self) -> Optional[IkWorkResult]:
+        with self._condition:
+            result = self._completed
+            if result is None:
+                return None
+            self._completed = None
+            # Refresh the queued target and seed from the control thread after
+            # it accepts or rejects this result.
+            self._pending = None
+            self._condition.notify_all()
+            return result
+
+    def cancel_pending(self) -> None:
+        """Discard work that has not started and any unconsumed result."""
+        with self._condition:
+            self._pending = None
+            self._completed = None
+            self._condition.notify_all()
+
+    def snapshot(self) -> IkWorkerSnapshot:
+        with self._condition:
+            return IkWorkerSnapshot(
+                in_flight=self._in_flight,
+                pending_request_id=(
+                    None if self._pending is None else self._pending.request_id
+                ),
+                completed_request_id=(
+                    None
+                    if self._completed is None
+                    else self._completed.request.request_id
+                ),
+                replaced_pending=self._replaced_pending,
+            )
+
+    def close(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._pending = None
+            self._completed = None
+            self._condition.notify_all()
+        if self._thread.is_alive():
+            # A rospy ServiceProxy call cannot be cancelled.  The daemon may
+            # therefore outlive shutdown if the remote service is wedged.
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while (
+                    not self._stop
+                    and (self._pending is None or self._completed is not None)
+                ):
+                    self._condition.wait(timeout=0.1)
+                if self._stop:
+                    return
+                request = self._pending
+                self._pending = None
+                self._in_flight = True
+
+            assert request is not None
+            started = time.monotonic()
+            try:
+                (
+                    valid,
+                    solution,
+                    result_code,
+                    accepted_target,
+                    accepted_alpha,
+                ) = self._backend.solve(request)
+                error = None
+            except Exception as exc:
+                valid = False
+                solution = {}
+                result_code = 0
+                accepted_target = None
+                accepted_alpha = 0.0
+                error = "{}: {}".format(type(exc).__name__, exc)
+            completed = time.monotonic()
+            result = IkWorkResult(
+                request=request,
+                started_monotonic=started,
+                completed_monotonic=completed,
+                valid=valid,
+                solution=solution,
+                result_code=result_code,
+                accepted_target=accepted_target,
+                accepted_alpha=accepted_alpha,
+                error=error,
+            )
+
+            with self._condition:
+                self._in_flight = False
+                if self._stop:
+                    return
+                self._completed = result
+                self._condition.notify_all()
+
+
+def ik_result_rejection_reason(
+    result: IkWorkResult,
+    active_session_id: int,
+    now_monotonic: float,
+    maximum_age: float,
+) -> Optional[str]:
+    """Return why an asynchronous result is unsafe to apply, if any."""
+    if result.request.session_id != active_session_id:
+        return "IK result belongs to an inactive Grip session"
+    age = now_monotonic - result.request.submitted_monotonic
+    if age < 0.0:
+        return "IK result timestamp is in the future"
+    if age > maximum_age:
+        return "stale IK result: {:.1f} ms".format(age * 1000.0)
+    return None
+
+
 def maximum_joint_difference(a: JointDict, b: JointDict) -> float:
     if set(a) != set(b):
         raise KeyError("joint sets do not match")
@@ -990,7 +1360,13 @@ def print_configuration(args: argparse.Namespace) -> None:
     print("IK branch threshold:    {:.3f} rad".format(args.max_ik_difference))
     print("First IK threshold:     {:.3f} rad".format(args.max_first_ik_difference))
     print("IK backtrack attempts:  {}".format(args.ik_backtrack_attempts))
+    print("IK backend:             {} (async latest-only)".format(
+        args.ik_backend
+    ))
     print("IK time budget:         {:.1f} ms".format(args.ik_budget_ms))
+    print("Maximum IK result age:  {:.1f} ms".format(
+        args.max_ik_result_age * 1000.0
+    ))
     print(
         "Orientation relaxation: after {} misses, up to {:.1f} deg".format(
             args.orientation_relax_after,
@@ -1027,12 +1403,26 @@ def main() -> None:
         )
 
     limb = baxter_interface.Limb(args.side)
-    service_name = (
-        "/ExternalTools/{}/PositionKinematicsNode/IKService"
-    ).format(args.side)
-    print("Waiting for IK service:", service_name)
-    rospy.wait_for_service(service_name, timeout=10.0)
-    ik_service = rospy.ServiceProxy(service_name, SolvePositionIK)
+    if args.ik_backend == "ros-service":
+        service_name = (
+            "/ExternalTools/{}/PositionKinematicsNode/IKService"
+        ).format(args.side)
+        print("Waiting for IK service:", service_name)
+        rospy.wait_for_service(service_name, timeout=10.0)
+        ik_service = rospy.ServiceProxy(service_name, SolvePositionIK)
+        ik_backend = RosServiceIkBackend(ik_service)
+    else:
+        try:
+            from baxter_pykdl import baxter_kinematics
+        except ImportError as exc:
+            raise SystemExit(
+                "--ik-backend pykdl requires the baxter_pykdl package"
+            ) from exc
+        ik_backend = PyKdlIkBackend(
+            baxter_kinematics(args.side),
+            list(limb.joint_names()),
+        )
+    ik_worker = LatestOnlyIkWorker(ik_backend)
 
     receiver = LatestPacketReceiver(args.bind_host, args.port)
 
@@ -1074,13 +1464,14 @@ def main() -> None:
     last_status_time = 0.0
     last_safety_report_time = 0.0
     consecutive_ik_misses = 0
-    # 完整的上一帧 IK 解：用于下一帧 SEED_USER 和分支连续性判断。
+    grip_session_id = 0
+    # 上一个完整且已接受的 IK 解，用作下一请求的 SEED_USER 和分支基准。
     last_successful_joint_command: Optional[JointDict] = None
 
-    # 实际发送给 Baxter 的关节位置命令。
+    # 最近一次实际发送给 Baxter 的关节位置命令。
     last_sent_joint_command: Optional[JointDict] = None
 
-    # 最近一次真正被 IK 接受的笛卡尔目标。
+    # 最近一次通过全部安全检查的笛卡尔目标。
     last_accepted_cartesian_position: Optional[Vector3] = None
 
     def report_safety(message: str) -> None:
@@ -1129,6 +1520,7 @@ def main() -> None:
         last_sent_joint_command = None
         last_accepted_cartesian_position = None
         consecutive_ik_misses = 0
+        ik_worker.cancel_pending()
         target_limiter.reset()
         moving_deadband.reset()
 
@@ -1170,6 +1562,7 @@ def main() -> None:
         limb.set_joint_position_speed(args.speed_ratio)
         receiver.start()
         command_publisher.start()
+        ik_worker.start()
 
         while not rospy.is_shutdown():
             now = time.monotonic()
@@ -1323,7 +1716,9 @@ def main() -> None:
                 # orientation captured at Grip lock.  Using the measured
                 # orientation every frame turns accidental drift into the next
                 # target and allows a self-reinforcing wrist/elbow twist.
-                robot_orientation_reference = copy.copy(endpoint["orientation"])
+                robot_orientation_reference = copy_quaternion(
+                    endpoint["orientation"]
+                )
                 target_limiter.reset(robot_position_reference)
 
                 # Seed the very first IK call with the exact Grip-lock joint
@@ -1339,6 +1734,7 @@ def main() -> None:
                     robot_position_reference
                 )
                 last_control_time = now
+                grip_session_id += 1
                 locked = True
 
                 print("[LOCK] Grip reference established")
@@ -1477,205 +1873,269 @@ def main() -> None:
                 subtract(smooth_position, current_endpoint_position)
             )
 
-            ik_started = time.monotonic()
-            try:
-                (
-                    valid,
-                    solution,
-                    result_code,
-                    accepted_target,
-                    accepted_alpha,
-                ) = solve_ik_with_backtracking(
-                    ik_service,
-                    current_endpoint_position,
-                    target_endpoint_orientation,
-                    smooth_position,
-                    last_successful_joint_command,
-                    args.ik_backtrack_attempts,
-                    args.ik_budget_ms,
+            # Only the main control thread may accept an IK result and update
+            # command/seed state.  The worker only performs the blocking ROS
+            # call and returns an immutable request/result pair.
+            ik_result = ik_worker.poll_result()
+            accepted_result = False
+            if ik_result is not None:
+                rejection = ik_result_rejection_reason(
+                    ik_result,
+                    grip_session_id,
+                    now,
+                    args.max_ik_result_age,
                 )
-            except rospy.ServiceException as exc:
-                consecutive_ik_misses += 1
-                ik_time_ms = (time.monotonic() - ik_started) * 1000.0
-                freeze_cartesian_target()
-                keep_previous_command()
-                if now - last_status_time >= 1.0 / args.status_rate_hz:
-                    print("[IK SKIP] service error: {}".format(exc))
-                    last_status_time = now
-                rate.sleep()
-                continue
-
-            ik_time_ms = (time.monotonic() - ik_started) * 1000.0
-
-            if not valid or accepted_target is None:
-                consecutive_ik_misses += 1
-                freeze_cartesian_target()
-                keep_previous_command()
-                if now - last_status_time >= 1.0 / args.status_rate_hz:
-                    print(
-                        "[IK SKIP] no reachable target; "
-                        "holding previous command; code={}".format(
-                            result_code
+                if rejection is not None:
+                    if ik_result.request.session_id == grip_session_id:
+                        consecutive_ik_misses += 1
+                        freeze_cartesian_target()
+                        keep_previous_command()
+                    if now - last_status_time >= 1.0 / args.status_rate_hz:
+                        print(
+                            "[IK STALE] request={} seq={}: {}".format(
+                                ik_result.request.request_id,
+                                ik_result.request.sequence,
+                                rejection,
+                            )
                         )
-                    )
-                    last_status_time = now
-                rate.sleep()
-                continue
-
-            consecutive_ik_misses = 0
-
-            current_angles = {
-                name: float(value)
-                for name, value in limb.joint_angles().items()
-            }
-            joint_tracking_error = 0.0
-            if last_sent_joint_command is not None and current_angles:
-                try:
-                    joint_tracking_error = maximum_joint_difference(
-                        last_sent_joint_command,
-                        current_angles,
-                    )
-                except KeyError:
-                    joint_tracking_error = float("nan")
-
-            if not current_angles or set(solution) != set(current_angles):
-                clear_reference(
-                    "IK joint set does not match limb joints",
-                    safety_stop=True,
-                )
-                rate.sleep()
-                continue
-
-            try:
-                assert last_successful_joint_command is not None
-                # Compare the new complete IK solution with the previous
-                # accepted complete IK solution.  At Grip start that previous
-                # solution is exactly the measured lock joint pose.
-                branch_difference = maximum_joint_difference(
-                    solution,
-                    last_successful_joint_command,
-                )
-            except KeyError as exc:
-                clear_reference(str(exc), safety_stop=True)
-                rate.sleep()
-                continue
-
-            active_branch_limit = args.max_ik_difference
-            if first_ik_pending and args.max_first_ik_difference > 0.0:
-                if active_branch_limit <= 0.0:
-                    active_branch_limit = args.max_first_ik_difference
+                        last_status_time = now
+                elif ik_result.error is not None:
+                    consecutive_ik_misses += 1
+                    freeze_cartesian_target()
+                    keep_previous_command()
+                    if now - last_status_time >= 1.0 / args.status_rate_hz:
+                        print("[IK SKIP] service error: {}".format(
+                            ik_result.error
+                        ))
+                        last_status_time = now
+                elif not ik_result.valid or ik_result.accepted_target is None:
+                    consecutive_ik_misses += 1
+                    freeze_cartesian_target()
+                    keep_previous_command()
+                    if now - last_status_time >= 1.0 / args.status_rate_hz:
+                        print(
+                            "[IK SKIP] no reachable target; "
+                            "holding previous command; code={}".format(
+                                ik_result.result_code
+                            )
+                        )
+                        last_status_time = now
                 else:
-                    active_branch_limit = min(
-                        active_branch_limit,
-                        args.max_first_ik_difference,
-                    )
+                    solution = ik_result.solution
+                    current_angles = {
+                        name: float(value)
+                        for name, value in limb.joint_angles().items()
+                    }
+                    joint_tracking_error = 0.0
+                    if last_sent_joint_command is not None and current_angles:
+                        try:
+                            joint_tracking_error = maximum_joint_difference(
+                                last_sent_joint_command,
+                                current_angles,
+                            )
+                        except KeyError:
+                            joint_tracking_error = float("nan")
 
-            if (
-                active_branch_limit > 0.0
-                and branch_difference > active_branch_limit
-            ):
-                freeze_cartesian_target()
-                keep_previous_command()
-                if now - last_status_time >= 1.0 / args.status_rate_hz:
-                    print(
-                        "[IK SKIP] IK jump {:.4f} rad exceeds {:.4f}; "
-                        "holding lock branch"
-                        .format(branch_difference, active_branch_limit)
-                    )
-                    last_status_time = now
-                rate.sleep()
-                continue
+                    if not current_angles or set(solution) != set(current_angles):
+                        clear_reference(
+                            "IK joint set does not match limb joints",
+                            safety_stop=True,
+                        )
+                        rate.sleep()
+                        continue
 
-            try:
-                command = limited_joint_command(
-                    current_angles,
-                    solution,
-                    args.max_joint_step,
-                )
-                command_publisher.set_command(command)
-            except Exception as exc:
-                clear_reference(
-                    "joint command failed: {}".format(exc),
-                    safety_stop=True,
-                )
-                rate.sleep()
-                continue
+                    try:
+                        assert last_successful_joint_command is not None
+                        branch_difference = maximum_joint_difference(
+                            solution,
+                            last_successful_joint_command,
+                        )
+                    except KeyError as exc:
+                        clear_reference(str(exc), safety_stop=True)
+                        rate.sleep()
+                        continue
 
-            last_sent_joint_command = dict(command)
-            last_successful_joint_command = dict(solution)
-            first_ik_pending = False
+                    active_branch_limit = args.max_ik_difference
+                    if (
+                        first_ik_pending
+                        and args.max_first_ik_difference > 0.0
+                    ):
+                        if active_branch_limit <= 0.0:
+                            active_branch_limit = args.max_first_ik_difference
+                        else:
+                            active_branch_limit = min(
+                                active_branch_limit,
+                                args.max_first_ik_difference,
+                            )
 
-            accepted_position = target_pose_position(accepted_target)
-            last_accepted_cartesian_position = list(accepted_position)
+                    if (
+                        active_branch_limit > 0.0
+                        and branch_difference > active_branch_limit
+                    ):
+                        consecutive_ik_misses += 1
+                        freeze_cartesian_target()
+                        keep_previous_command()
+                        if now - last_status_time >= 1.0 / args.status_rate_hz:
+                            print(
+                                "[IK SKIP] IK jump {:.4f} rad exceeds {:.4f}; "
+                                "holding lock branch".format(
+                                    branch_difference,
+                                    active_branch_limit,
+                                )
+                            )
+                            last_status_time = now
+                    else:
+                        try:
+                            command = limited_joint_command(
+                                current_angles,
+                                solution,
+                                args.max_joint_step,
+                            )
+                            command_publisher.set_command(command)
+                        except Exception as exc:
+                            clear_reference(
+                                "joint command failed: {}".format(exc),
+                                safety_stop=True,
+                            )
+                            rate.sleep()
+                            continue
 
-            if accepted_alpha < 1.0:
-                target_limiter.accept_backtracked_position(
-                    accepted_position,
-                    accepted_alpha,
-                )
+                        consecutive_ik_misses = 0
+                        last_sent_joint_command = dict(command)
+                        last_successful_joint_command = dict(solution)
+                        first_ik_pending = False
+                        accepted_result = True
 
-            diagnostics.write(
-                {
-                    "wall_time": time.time(),
-                    "event": "MOVE",
-                    "seq": latest_sequence,
-                    "packet_age_ms": latest_packet_age * 1000.0,
-                    "grip": latest_grip,
-                    "loop_dt_ms": control_dt * 1000.0,
-                    "raw_hand_dx": raw_hand_delta[0],
-                    "raw_hand_dy": raw_hand_delta[1],
-                    "raw_hand_dz": raw_hand_delta[2],
-                    "hand_dx": hand_delta[0],
-                    "hand_dy": hand_delta[1],
-                    "hand_dz": hand_delta[2],
-                    "robot_dx": robot_delta[0],
-                    "robot_dy": robot_delta[1],
-                    "robot_dz": robot_delta[2],
-                    "desired_lag_m": desired_lag,
-                    "tracking_error_m": tracking_error,
-                    "joint_tracking_error_rad": joint_tracking_error,
-                    "command_speed_mps": vector_norm(target_limiter.velocity),
-                    "ik_time_ms": ik_time_ms,
-                    "ik_alpha": accepted_alpha,
-                    "ik_diff_rad": branch_difference,
-                    "ik_code": result_code,
-                    "translation_saturated": int(translation_saturated),
-                    "command_lead_saturated": int(command_lead_saturated),
-                    "speed_saturated": int(target_limiter.speed_saturated),
-                    "acceleration_saturated": int(
-                        target_limiter.acceleration_saturated
-                    ),
-                }
+                        accepted_position = target_pose_position(
+                            ik_result.accepted_target
+                        )
+                        last_accepted_cartesian_position = list(
+                            accepted_position
+                        )
+                        if ik_result.accepted_alpha < 1.0:
+                            target_limiter.accept_backtracked_position(
+                                accepted_position,
+                                ik_result.accepted_alpha,
+                            )
+
+                        result_age_ms = (
+                            now - ik_result.request.submitted_monotonic
+                        ) * 1000.0
+                        worker_snapshot = ik_worker.snapshot()
+                        diagnostics.write(
+                            {
+                                "wall_time": time.time(),
+                                "event": "MOVE",
+                                "seq": latest_sequence,
+                                "packet_age_ms": latest_packet_age * 1000.0,
+                                "grip": latest_grip,
+                                "loop_dt_ms": control_dt * 1000.0,
+                                "raw_hand_dx": raw_hand_delta[0],
+                                "raw_hand_dy": raw_hand_delta[1],
+                                "raw_hand_dz": raw_hand_delta[2],
+                                "hand_dx": hand_delta[0],
+                                "hand_dy": hand_delta[1],
+                                "hand_dz": hand_delta[2],
+                                "robot_dx": robot_delta[0],
+                                "robot_dy": robot_delta[1],
+                                "robot_dz": robot_delta[2],
+                                "desired_lag_m": desired_lag,
+                                "tracking_error_m": tracking_error,
+                                "joint_tracking_error_rad": joint_tracking_error,
+                                "command_speed_mps": vector_norm(
+                                    target_limiter.velocity
+                                ),
+                                "ik_backend": args.ik_backend,
+                                "ik_time_ms": ik_result.solve_time_ms,
+                                "ik_result_age_ms": result_age_ms,
+                                "ik_request_id": ik_result.request.request_id,
+                                "ik_request_seq": ik_result.request.sequence,
+                                "ik_replaced_pending": (
+                                    worker_snapshot.replaced_pending
+                                ),
+                                "ik_alpha": ik_result.accepted_alpha,
+                                "ik_diff_rad": branch_difference,
+                                "ik_code": ik_result.result_code,
+                                "translation_saturated": int(
+                                    translation_saturated
+                                ),
+                                "command_lead_saturated": int(
+                                    command_lead_saturated
+                                ),
+                                "speed_saturated": int(
+                                    target_limiter.speed_saturated
+                                ),
+                                "acceleration_saturated": int(
+                                    target_limiter.acceleration_saturated
+                                ),
+                            }
+                        )
+
+                        if now - last_status_time >= 1.0 / args.status_rate_hz:
+                            saturation_flags = "{}{}{}{}".format(
+                                "T" if translation_saturated else "-",
+                                "L" if command_lead_saturated else "-",
+                                "V" if target_limiter.speed_saturated else "-",
+                                "A" if target_limiter.acceleration_saturated else "-",
+                            )
+                            print(
+                                "[MOVE] seq={}/{} age={:.1f}ms grip={:.2f} "
+                                "hand={:.3f}m cmd_delta={:.3f}m v={:.3f}m/s "
+                                "lag={:.3f}m track={:.3f}m joint_err={:.3f}rad "
+                                "ik={:.1f}ms result_age={:.1f}ms alpha={:.3f} "
+                                "diff={:.4f} relax={:.1f}deg sat={}".format(
+                                    ik_result.request.sequence,
+                                    latest_sequence,
+                                    latest_packet_age * 1000.0,
+                                    latest_grip,
+                                    vector_norm(hand_delta),
+                                    vector_norm(robot_delta),
+                                    vector_norm(target_limiter.velocity),
+                                    desired_lag,
+                                    tracking_error,
+                                    joint_tracking_error,
+                                    ik_result.solve_time_ms,
+                                    result_age_ms,
+                                    ik_result.accepted_alpha,
+                                    branch_difference,
+                                    math.degrees(orientation_relaxation),
+                                    saturation_flags,
+                                )
+                            )
+                            last_status_time = now
+
+            # While one request is in flight this replaces only the pending
+            # target.  No FIFO is created and the robot continues receiving the
+            # last accepted command from ContinuousJointCommandPublisher.
+            submission_position = (
+                list(target_limiter.position)
+                if target_limiter.position is not None
+                else list(smooth_position)
+            )
+            ik_worker.submit(
+                session_id=grip_session_id,
+                sequence=latest_sequence,
+                current_position=current_endpoint_position,
+                current_orientation=target_endpoint_orientation,
+                desired_position=submission_position,
+                seed_angles=last_successful_joint_command,
+                attempts=args.ik_backtrack_attempts,
+                budget_ms=args.ik_budget_ms,
+                submitted_monotonic=now,
             )
 
-            if now - last_status_time >= 1.0 / args.status_rate_hz:
-                saturation_flags = "{}{}{}{}".format(
-                    "T" if translation_saturated else "-",
-                    "L" if command_lead_saturated else "-",
-                    "V" if target_limiter.speed_saturated else "-",
-                    "A" if target_limiter.acceleration_saturated else "-",
-                )
+            if (
+                not accepted_result
+                and ik_result is None
+                and now - last_status_time >= 1.0 / args.status_rate_hz
+            ):
+                worker_snapshot = ik_worker.snapshot()
                 print(
-                    "[MOVE] seq={} age={:.1f}ms grip={:.2f} "
-                    "hand={:.3f}m cmd_delta={:.3f}m v={:.3f}m/s "
-                    "lag={:.3f}m track={:.3f}m joint_err={:.3f}rad "
-                    "ik={:.1f}ms alpha={:.3f} diff={:.4f} "
-                    "relax={:.1f}deg sat={}"
-                    .format(
+                    "[IK WAIT] seq={} in_flight={} pending={} replaced={}".format(
                         latest_sequence,
-                        latest_packet_age * 1000.0,
-                        latest_grip,
-                        vector_norm(hand_delta),
-                        vector_norm(robot_delta),
-                        vector_norm(target_limiter.velocity),
-                        desired_lag,
-                        tracking_error,
-                        joint_tracking_error,
-                        ik_time_ms,
-                        accepted_alpha,
-                        branch_difference,
-                        math.degrees(orientation_relaxation),
-                        saturation_flags,
+                        int(worker_snapshot.in_flight),
+                        worker_snapshot.pending_request_id,
+                        worker_snapshot.replaced_pending,
                     )
                 )
                 last_status_time = now
@@ -1697,6 +2157,7 @@ def main() -> None:
                 time.sleep(0.10)
         except Exception as exc:
             rospy.logerr("Failed to issue final hold command: %s", exc)
+        ik_worker.close()
         command_publisher.close()
         try:
             limb.set_joint_position_speed(DEFAULT_BAXTER_SPEED_RATIO)

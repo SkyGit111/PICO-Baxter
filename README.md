@@ -18,10 +18,15 @@
 PICO 4 Ultra
 → XR PC Service
 → SdkXRInputSource
-→ TeleopEngine
-→ Baxter bridge
+→ bridge/pico_udp_sender.py
+→ UDP latest-only 输入
+→ bridge/baxter_precision_teleop.py
+→ single-flight 异步 Baxter IK
 → Baxter SDK
 ```
+
+当前 Baxter 入口仍是单臂平移控制；双臂、手柄旋转和夹爪尚未接入实机控制链。
+`pico-teleop` 内含通用 `TeleopEngine` 抽象，但当前 Baxter 运行入口没有经过它。
 
 ## 视觉反馈链
 
@@ -47,3 +52,6 @@ D455 初始输入为 1280×720、30 FPS，发送前将同一 RGB 图像横向复
 [`vision/LATENCY_TUNING.md`](vision/LATENCY_TUNING.md)。
 
 导入的上游版本记录参见 [`UPSTREAM_VERSIONS.md`](UPSTREAM_VERSIONS.md)。
+
+控制流与视频流的当前状态、真机证据、已知问题和后续联合优化计划参见
+[`PICO_VIDEO_CONTROL_HANDOFF.md`](PICO_VIDEO_CONTROL_HANDOFF.md)。

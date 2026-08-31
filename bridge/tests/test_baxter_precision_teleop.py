@@ -83,6 +83,14 @@ def quaternion(z_degrees):
 
 
 class QuaternionTests(unittest.TestCase):
+    def test_copy_quaternion_does_not_depend_on_source_mutability(self):
+        source = quaternion(30.0)
+        copied = teleop.copy_quaternion(source)
+        self.assertIsInstance(copied, teleop.QuaternionValue)
+        self.assertIsNot(copied, source)
+        self.assertAlmostEqual(copied.z, source.z)
+        self.assertAlmostEqual(copied.w, source.w)
+
     def test_distance_uses_shortest_rotation(self):
         identity = quaternion(0.0)
         same_with_opposite_sign = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=-1.0)
@@ -243,6 +251,235 @@ class CommandPublisherTests(unittest.TestCase):
         finally:
             publisher.close()
         self.assertIn("write failed", publisher.error())
+
+
+class AsyncIkWorkerTests(unittest.TestCase):
+    class Response:
+        RESULT_INVALID = 0
+
+        def __init__(self):
+            self.result_type = [1]
+            self.joints = [SimpleNamespace(name=["j0"], position=[0.2])]
+
+    def wait_for_result(self, worker, timeout=0.5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = worker.poll_result()
+            if result is not None:
+                return result
+            time.sleep(0.002)
+        self.fail("timed out waiting for IK result")
+
+    def submit(self, worker, session_id, sequence, x):
+        return worker.submit(
+            session_id=session_id,
+            sequence=sequence,
+            current_position=[0.0, 0.0, 0.0],
+            current_orientation=quaternion(0.0),
+            desired_position=[x, 0.0, 0.0],
+            seed_angles={"j0": 0.1},
+            attempts=1,
+            budget_ms=100.0,
+        )
+
+    def test_worker_is_single_flight_and_drops_stale_pending_seed(self):
+        entered = threading.Event()
+        release = threading.Event()
+        requested_x = []
+
+        def service(request):
+            requested_x.append(request.pose_stamp[0].pose.position.x)
+            entered.set()
+            release.wait(0.5)
+            return self.Response()
+
+        worker = teleop.LatestOnlyIkWorker(service)
+        worker.start()
+        try:
+            first_id = self.submit(worker, session_id=1, sequence=10, x=0.1)
+            self.assertTrue(entered.wait(0.5))
+            self.submit(worker, session_id=1, sequence=11, x=0.2)
+            self.submit(worker, session_id=1, sequence=12, x=0.3)
+            self.assertEqual(worker.snapshot().replaced_pending, 1)
+
+            release.set()
+            result = self.wait_for_result(worker)
+            self.assertEqual(result.request.request_id, first_id)
+            self.assertEqual(requested_x, [0.1])
+
+            # poll_result discarded the pre-result pending request.  Only a
+            # freshly submitted target may start with the refreshed seed.
+            time.sleep(0.02)
+            self.assertEqual(requested_x, [0.1])
+            self.submit(worker, session_id=1, sequence=13, x=0.4)
+            second = self.wait_for_result(worker)
+            self.assertEqual(second.request.sequence, 13)
+            self.assertEqual(requested_x, [0.1, 0.4])
+        finally:
+            worker.close()
+
+
+    def test_cancel_pending_cannot_leak_old_session_result(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def service(_request):
+            entered.set()
+            release.wait(0.5)
+            return self.Response()
+
+        worker = teleop.LatestOnlyIkWorker(service)
+        worker.start()
+        try:
+            self.submit(worker, session_id=4, sequence=20, x=0.1)
+            self.assertTrue(entered.wait(0.5))
+            worker.cancel_pending()
+            release.set()
+            result = self.wait_for_result(worker)
+            reason = teleop.ik_result_rejection_reason(
+                result,
+                active_session_id=5,
+                now_monotonic=time.monotonic(),
+                maximum_age=1.0,
+            )
+            self.assertIn("inactive Grip session", reason)
+        finally:
+            worker.close()
+
+
+    def test_old_result_is_rejected_by_age(self):
+        request = teleop.IkWorkItem(
+            request_id=1,
+            session_id=2,
+            sequence=3,
+            submitted_monotonic=10.0,
+            current_position=[0.0, 0.0, 0.0],
+            current_orientation=teleop.QuaternionValue(0.0, 0.0, 0.0, 1.0),
+            desired_position=[0.1, 0.0, 0.0],
+            seed_angles={"j0": 0.0},
+            attempts=1,
+            budget_ms=10.0,
+        )
+        result = teleop.IkWorkResult(
+            request=request,
+            started_monotonic=10.0,
+            completed_monotonic=10.2,
+            valid=True,
+            solution={"j0": 0.1},
+            result_code=1,
+            accepted_target=None,
+            accepted_alpha=1.0,
+            error=None,
+        )
+        reason = teleop.ik_result_rejection_reason(
+            result,
+            active_session_id=2,
+            now_monotonic=11.0,
+            maximum_age=0.25,
+        )
+        self.assertIn("stale IK result", reason)
+
+    def test_many_submissions_keep_only_one_pending_request(self):
+        worker = teleop.LatestOnlyIkWorker(lambda _request: self.Response())
+        try:
+            started = time.monotonic()
+            last_id = None
+            for sequence in range(1000):
+                last_id = self.submit(
+                    worker,
+                    session_id=7,
+                    sequence=sequence,
+                    x=sequence / 1000.0,
+                )
+            elapsed = time.monotonic() - started
+            snapshot = worker.snapshot()
+            self.assertEqual(snapshot.pending_request_id, last_id)
+            self.assertEqual(snapshot.replaced_pending, 999)
+            self.assertLess(elapsed, 0.25)
+        finally:
+            worker.close()
+
+    def test_service_exception_is_returned_without_killing_worker(self):
+        calls = []
+
+        def failing_service(_request):
+            calls.append(1)
+            raise RuntimeError("service unavailable")
+
+        worker = teleop.LatestOnlyIkWorker(failing_service)
+        worker.start()
+        try:
+            self.submit(worker, session_id=1, sequence=1, x=0.1)
+            first = self.wait_for_result(worker)
+            self.assertFalse(first.valid)
+            self.assertIn("service unavailable", first.error)
+
+            self.submit(worker, session_id=1, sequence=2, x=0.2)
+            second = self.wait_for_result(worker)
+            self.assertEqual(second.request.sequence, 2)
+            self.assertEqual(len(calls), 2)
+        finally:
+            worker.close()
+
+
+class PyKdlIkBackendTests(unittest.TestCase):
+    def request(self, desired=None, seed=None, attempts=3):
+        return teleop.IkWorkItem(
+            request_id=1,
+            session_id=1,
+            sequence=1,
+            submitted_monotonic=time.monotonic(),
+            current_position=[0.0, 0.0, 0.0],
+            current_orientation=teleop.QuaternionValue(
+                0.0, 0.0, 0.0, 1.0
+            ),
+            desired_position=desired or [0.2, 0.0, 0.0],
+            seed_angles=(
+                {"j0": 0.1, "j1": -0.1} if seed is None else seed
+            ),
+            attempts=attempts,
+            budget_ms=100.0,
+        )
+
+    def test_local_backend_uses_ordered_seed_and_full_target(self):
+        calls = []
+
+        class Kinematics:
+            def inverse_kinematics(self, position, orientation, seed):
+                calls.append((position, orientation, seed))
+                return [0.2, -0.2]
+
+        backend = teleop.PyKdlIkBackend(Kinematics(), ["j0", "j1"])
+        valid, solution, code, target, alpha = backend.solve(self.request())
+
+        self.assertTrue(valid)
+        self.assertEqual(solution, {"j0": 0.2, "j1": -0.2})
+        self.assertEqual(code, 1)
+        self.assertEqual(alpha, 1.0)
+        self.assertAlmostEqual(target.pose.position.x, 0.2)
+        self.assertEqual(calls[0][1], [0.0, 0.0, 0.0, 1.0])
+        self.assertEqual(calls[0][2], [0.1, -0.1])
+
+    def test_local_backend_backtracks_without_changing_seed(self):
+        calls = []
+
+        class Kinematics:
+            def inverse_kinematics(self, position, _orientation, seed):
+                calls.append((list(position), list(seed)))
+                return None if len(calls) == 1 else [0.15, -0.15]
+
+        backend = teleop.PyKdlIkBackend(Kinematics(), ["j0", "j1"])
+        valid, _solution, _code, target, alpha = backend.solve(self.request())
+
+        self.assertTrue(valid)
+        self.assertEqual(alpha, 0.5)
+        self.assertAlmostEqual(target.pose.position.x, 0.1)
+        self.assertEqual(calls[0][1], calls[1][1])
+
+    def test_local_backend_rejects_wrong_seed_joint_set(self):
+        backend = teleop.PyKdlIkBackend(object(), ["j0", "j1"])
+        with self.assertRaises(KeyError):
+            backend.solve(self.request(seed={"j0": 0.0}))
 
 
 if __name__ == "__main__":
