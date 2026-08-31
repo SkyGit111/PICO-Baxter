@@ -2,7 +2,7 @@
 
 `baxter_precision_teleop.py` 是当前单臂 PICO → Baxter 实机控制入口。它保留已验证
 的 UDP 协议、坐标映射和 Baxter 安全检查，并且只控制指定机械臂的平移；控制器
-旋转和夹爪命令仍然禁用。
+旋转仍然禁用，夹爪只有显式加入 `--enable-gripper` 才会启用。
 
 ## 当前控制链
 
@@ -18,6 +18,62 @@ PICO 4 Ultra
 ```
 
 视频服务位于独立进程中，不会调用本控制桥。
+
+## 双臂进程拓扑
+
+双臂模式不把两个复杂状态机合并到一个循环，而是由同一个 XR sender 将完全相同的
+双手数据包扇出到两个本地端口；左右臂各运行一个控制进程：
+
+```text
+SdkXRInputSource
+├─ UDP 127.0.0.1:15000 → left 进程 → left IK worker → left arm/gripper
+└─ UDP 127.0.0.1:15001 → right 进程 → right IK worker → right arm/gripper
+```
+
+发送端只读取一次 PICO，D455 也仍由视频进程独占。启动 sender：
+
+```bash
+/usr/bin/python3 bridge/pico_udp_sender.py \
+  --host 127.0.0.1 \
+  --port 15000 \
+  --additional-port 15001 \
+  --rate-hz 50
+```
+
+首次双臂测试应先禁用夹爪并限制范围，在两个已经 source Baxter/ROS 环境的终端分别运行：
+
+```bash
+/usr/bin/python3 bridge/baxter_precision_teleop.py \
+  --side left --port 15000 --scale 0.30 --max-translation 0.05 \
+  --speed-ratio 0.30 --execute
+```
+
+```bash
+/usr/bin/python3 bridge/baxter_precision_teleop.py \
+  --side right --port 15001 --scale 0.30 --max-translation 0.05 \
+  --speed-ratio 0.30 --execute
+```
+
+两个进程控制不相交的关节集合并具有独立的 IK、Grip session 和故障状态，但当前没有
+双臂互相碰撞检测。必须先把两臂置于明显分离的工作区，分别完成单臂小位移测试后再联合。
+
+## 可选夹爪控制
+
+XR 数据包已经包含左右 Trigger。加入 `--enable-gripper` 后，该侧进程会创建独立的
+latest-only 夹爪发布线程：
+
+- 电动夹爪：Trigger `0 → 1` 映射为 Baxter `100% open → 0% closed`；
+- 吸盘：使用带迟滞的 Trigger 开/关控制；
+- 默认 `10 Hz`，电动夹爪默认 `2%` 行程死区；
+- 命令全部使用 `block=False`，夹爪通信不在机械臂控制循环中执行；
+- 不会自动校准、reset 或清除错误；未校准、报错或没有受支持夹爪时拒绝启动夹爪功能；
+- 夹爪发布线程后续出错时停止夹爪命令并报告错误，不停止该侧机械臂的 Grip dead-man。
+
+确认夹爪已经人工校准、工作区安全后，才可在对应单臂命令末尾加入：
+
+```bash
+--enable-gripper
+```
 
 ## 本次控制改进
 

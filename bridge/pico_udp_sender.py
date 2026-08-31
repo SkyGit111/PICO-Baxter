@@ -11,7 +11,7 @@ import json
 import math
 import socket
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 PROTOCOL_VERSION = 1
@@ -154,10 +154,33 @@ def build_mock_packet(seq: int, start_time: float) -> Dict[str, Any]:
     }
 
 
+def build_destinations(
+    host: str,
+    primary_port: int,
+    additional_ports: List[int],
+) -> List[Tuple[str, int]]:
+    """Return a stable de-duplicated local fan-out destination list."""
+    ports = [primary_port] + list(additional_ports)
+    for port in ports:
+        if not 0 < port <= 65535:
+            raise ValueError("UDP ports must be in [1, 65535]")
+    return [(host, port) for port in dict.fromkeys(ports)]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=15000)
+    parser.add_argument(
+        "--additional-port",
+        type=int,
+        action="append",
+        default=[],
+        help=(
+            "Send the same latest XR packet to another UDP port. Repeat this "
+            "option to fan out to independently running arm processes."
+        ),
+    )
     parser.add_argument("--rate-hz", type=float, default=20.0)
     parser.add_argument(
         "--mock",
@@ -173,7 +196,11 @@ def main() -> None:
     if args.rate_hz <= 0:
         raise ValueError("--rate-hz must be greater than zero")
 
-    destination = (args.host, args.port)
+    destinations = build_destinations(
+        args.host,
+        args.port,
+        args.additional_port,
+    )
     period = 1.0 / args.rate_hz
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -187,7 +214,9 @@ def main() -> None:
     print(
         "PICO UDP sender started:",
         f"mode={'mock' if args.mock else 'real'}",
-        f"destination={args.host}:{args.port}",
+        "destinations={}".format(
+            ",".join("{}:{}".format(*item) for item in destinations)
+        ),
         f"rate={args.rate_hz:.1f} Hz",
     )
 
@@ -214,7 +243,8 @@ def main() -> None:
                     f"UDP packet is unexpectedly large: {len(encoded)} bytes"
                 )
 
-            sock.sendto(encoded, destination)
+            for destination in destinations:
+                sock.sendto(encoded, destination)
 
             if seq % max(1, int(args.rate_hz)) == 0:
                 print(

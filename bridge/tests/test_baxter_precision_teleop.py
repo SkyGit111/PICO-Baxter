@@ -119,6 +119,26 @@ class QuaternionTests(unittest.TestCase):
         self.assertEqual(reference.w, 1.0)
 
 
+class ControllerInputTests(unittest.TestCase):
+    def test_trigger_is_clamped_and_invalid_values_are_safe(self):
+        self.assertEqual(
+            teleop.controller_trigger({"left": {"trigger": 2.0}}, "left"),
+            1.0,
+        )
+        self.assertEqual(
+            teleop.controller_trigger({"left": {"trigger": -1.0}}, "left"),
+            0.0,
+        )
+        self.assertEqual(
+            teleop.controller_trigger({"left": {"trigger": "bad"}}, "left"),
+            0.0,
+        )
+        self.assertEqual(
+            teleop.controller_trigger({"left": {"trigger": float("nan")}}, "left"),
+            0.0,
+        )
+
+
 class TargetLimiterTests(unittest.TestCase):
     def test_enforce_position_preserves_bounded_velocity(self):
         limiter = teleop.CartesianTargetLimiter(0.5, 2.0, 0.04)
@@ -251,6 +271,104 @@ class CommandPublisherTests(unittest.TestCase):
         finally:
             publisher.close()
         self.assertIn("write failed", publisher.error())
+
+
+class GripperPublisherTests(unittest.TestCase):
+    class Gripper:
+        name = "left_gripper"
+
+        def __init__(self, gripper_type="electric", calibrated=True):
+            self.gripper_type = gripper_type
+            self.is_calibrated = calibrated
+            self.has_error = False
+            self.positions = []
+            self.suction_commands = []
+            self.received = threading.Event()
+
+        def type(self):
+            return self.gripper_type
+
+        def calibrated(self):
+            return self.is_calibrated
+
+        def error(self):
+            return self.has_error
+
+        def command_position(self, position, block=False):
+            self.positions.append((position, block))
+            self.received.set()
+            return True
+
+        def close(self, block=False):
+            self.suction_commands.append(("close", block))
+            return True
+
+        def open(self, block=False):
+            self.suction_commands.append(("open", block))
+            return True
+
+    def publisher(self, gripper):
+        return teleop.LatestGripperCommandPublisher(
+            gripper=gripper,
+            rate_hz=100.0,
+            electric_deadband=2.0,
+            suction_press=0.6,
+            suction_release=0.4,
+        )
+
+    def test_electric_trigger_is_inverted_and_non_blocking(self):
+        gripper = self.Gripper()
+        publisher = self.publisher(gripper)
+        publisher.set_trigger(0.75)
+        publisher.start()
+        try:
+            self.assertTrue(gripper.received.wait(0.5))
+        finally:
+            publisher.close()
+        self.assertEqual(gripper.positions[0], (25.0, False))
+        self.assertIsNone(publisher.error())
+
+    def test_electric_deadband_suppresses_nearby_commands(self):
+        gripper = self.Gripper()
+        publisher = self.publisher(gripper)
+        publisher._command_electric(0.50)
+        publisher._command_electric(0.51)
+        publisher._command_electric(0.55)
+        self.assertEqual(len(gripper.positions), 2)
+        self.assertAlmostEqual(gripper.positions[0][0], 50.0)
+        self.assertAlmostEqual(gripper.positions[1][0], 45.0)
+        self.assertFalse(gripper.positions[0][1])
+        self.assertFalse(gripper.positions[1][1])
+
+    def test_suction_uses_hysteresis(self):
+        gripper = self.Gripper(gripper_type="suction")
+        publisher = self.publisher(gripper)
+        for trigger in (0.0, 0.5, 0.7, 0.5, 0.2):
+            publisher._command_suction(trigger)
+        self.assertEqual(
+            gripper.suction_commands,
+            [("open", False), ("close", False), ("open", False)],
+        )
+
+    def test_uncalibrated_electric_gripper_is_rejected_without_calibrating(self):
+        gripper = self.Gripper(calibrated=False)
+        with self.assertRaisesRegex(ValueError, "not calibrated"):
+            self.publisher(gripper)
+
+    def test_runtime_gripper_error_stops_only_gripper_worker(self):
+        gripper = self.Gripper()
+        publisher = self.publisher(gripper)
+        gripper.has_error = True
+        publisher.set_trigger(0.5)
+        publisher.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while publisher.error() is None and time.monotonic() < deadline:
+                time.sleep(0.002)
+        finally:
+            publisher.close()
+        self.assertIn("error state", publisher.error())
+        self.assertEqual(gripper.positions, [])
 
 
 class AsyncIkWorkerTests(unittest.TestCase):

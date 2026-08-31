@@ -19,7 +19,7 @@ Deliberate scope:
 - translation only (controller rotation is ignored);
 - Grip is the dead-man switch;
 - no gripper command is sent (Trigger is reserved for a later, separately
-  verified gripper stage);
+  verified gripper stage) unless --enable-gripper is explicitly present;
 - no automatic robot enable;
 - normal POSITION_MODE only, never RAW_POSITION_MODE.
 
@@ -225,6 +225,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connection-timeout", type=float, default=0.75)
     parser.add_argument("--grip-press", type=float, default=0.60)
     parser.add_argument("--grip-release", type=float, default=0.40)
+    parser.add_argument(
+        "--enable-gripper",
+        action="store_true",
+        help=(
+            "Opt in to commanding this arm's existing calibrated gripper "
+            "from Trigger. Calibration and error reset are never automatic."
+        ),
+    )
+    parser.add_argument("--gripper-rate-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--gripper-deadband",
+        type=float,
+        default=2.0,
+        help="Electric gripper command deadband in percent of travel.",
+    )
+    parser.add_argument("--suction-trigger-press", type=float, default=0.60)
+    parser.add_argument("--suction-trigger-release", type=float, default=0.40)
     parser.add_argument("--status-rate-hz", type=float, default=5.0)
     parser.add_argument(
         "--csv-log",
@@ -298,6 +315,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "Grip thresholds must satisfy 0 <= release < press <= 1."
         )
+    if args.gripper_rate_hz <= 0.0:
+        raise ValueError("--gripper-rate-hz must be positive.")
+    if not (0.0 <= args.gripper_deadband <= 100.0):
+        raise ValueError("--gripper-deadband must be in [0, 100].")
+    if not (
+        0.0
+        <= args.suction_trigger_release
+        < args.suction_trigger_press
+        <= 1.0
+    ):
+        raise ValueError(
+            "Suction thresholds must satisfy 0 <= release < press <= 1."
+        )
     if args.status_rate_hz <= 0.0:
         raise ValueError("--status-rate-hz must be positive.")
     if not (0 < args.port <= 65535):
@@ -332,6 +362,19 @@ def controller_grip(packet: Dict[str, Any], side: str) -> float:
         return 0.0
     try:
         value = float(controller.get("grip", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+def controller_trigger(packet: Dict[str, Any], side: str) -> float:
+    controller = packet.get(side)
+    if not isinstance(controller, dict):
+        return 0.0
+    try:
+        value = float(controller.get("trigger", 0.0))
     except (TypeError, ValueError):
         return 0.0
     if not math.isfinite(value):
@@ -577,6 +620,7 @@ class CsvDiagnostics:
         "seq",
         "packet_age_ms",
         "grip",
+        "trigger",
         "loop_dt_ms",
         "raw_hand_dx",
         "raw_hand_dy",
@@ -792,6 +836,125 @@ class ContinuousJointCommandPublisher:
                 except Exception as exc:
                     with self._lock:
                         self._error = "joint publisher failed: {}".format(exc)
+                    return
+
+            next_time += self._period
+            delay = next_time - time.monotonic()
+            if delay > 0.0:
+                time.sleep(delay)
+            else:
+                next_time = time.monotonic()
+
+
+class LatestGripperCommandPublisher:
+    """Rate-limit latest-only Trigger commands on a dedicated thread."""
+
+    def __init__(
+        self,
+        gripper: Any,
+        rate_hz: float,
+        electric_deadband: float,
+        suction_press: float,
+        suction_release: float,
+    ) -> None:
+        self._gripper = gripper
+        self._period = 1.0 / rate_hz
+        self._electric_deadband = electric_deadband
+        self._suction_press = suction_press
+        self._suction_release = suction_release
+        self._type = gripper.type()
+        if self._type not in ("electric", "suction"):
+            raise ValueError(
+                "{} gripper is unsupported or not attached: {}".format(
+                    getattr(gripper, "name", "Baxter"),
+                    self._type,
+                )
+            )
+        if bool(gripper.error()):
+            raise ValueError("gripper reports an error; reset it manually")
+        if self._type == "electric" and not bool(gripper.calibrated()):
+            raise ValueError(
+                "electric gripper is not calibrated; calibrate it manually"
+            )
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="baxter-gripper-command-publisher",
+            daemon=True,
+        )
+        self._latest_trigger: Optional[float] = None
+        self._last_electric_position: Optional[float] = None
+        self._suction_active = False
+        self._suction_initialized = False
+        self._error: Optional[str] = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def set_trigger(self, trigger: float) -> None:
+        with self._lock:
+            self._latest_trigger = max(0.0, min(1.0, float(trigger)))
+
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _command_electric(self, trigger: float) -> None:
+        # PICO Trigger 0=open, 1=closed. Baxter uses 100=open, 0=closed.
+        position = 100.0 * (1.0 - trigger)
+        if (
+            self._last_electric_position is not None
+            and abs(position - self._last_electric_position)
+            < self._electric_deadband
+        ):
+            return
+        if not self._gripper.command_position(position, block=False):
+            raise RuntimeError("electric gripper rejected position command")
+        self._last_electric_position = position
+
+    def _command_suction(self, trigger: float) -> None:
+        active = self._suction_active
+        if trigger >= self._suction_press:
+            active = True
+        elif trigger <= self._suction_release:
+            active = False
+        if self._suction_initialized and active == self._suction_active:
+            return
+        command_ok = (
+            self._gripper.close(block=False)
+            if active
+            else self._gripper.open(block=False)
+        )
+        if not command_ok:
+            raise RuntimeError("suction gripper rejected command")
+        self._suction_active = active
+        self._suction_initialized = True
+
+    def _run(self) -> None:
+        next_time = time.monotonic()
+        while not self._stop_event.is_set() and not rospy.is_shutdown():
+            with self._lock:
+                trigger = self._latest_trigger
+            if trigger is not None:
+                try:
+                    if bool(self._gripper.error()):
+                        raise RuntimeError("gripper entered an error state")
+                    if self._type == "electric":
+                        if not bool(self._gripper.calibrated()):
+                            raise RuntimeError("gripper lost calibration")
+                        self._command_electric(trigger)
+                    else:
+                        self._command_suction(trigger)
+                except Exception as exc:
+                    with self._lock:
+                        self._error = "gripper publisher failed: {}".format(exc)
                     return
 
             next_time += self._period
@@ -1375,7 +1538,13 @@ def print_configuration(args: argparse.Namespace) -> None:
     )
     print("Mapping:                [-PICO z, -PICO x, +PICO y]")
     print("Rotation:               DISABLED")
-    print("Gripper:                NOT COMMANDED")
+    print(
+        "Gripper:                {}".format(
+            "TRIGGER ENABLED (no auto calibration)"
+            if args.enable_gripper
+            else "NOT COMMANDED"
+        )
+    )
     print("Other arm:              NOT COMMANDED")
     print("Automatic enable:       DISABLED")
     print("")
@@ -1403,6 +1572,25 @@ def main() -> None:
         )
 
     limb = baxter_interface.Limb(args.side)
+    gripper_publisher: Optional[LatestGripperCommandPublisher] = None
+    if args.enable_gripper:
+        try:
+            gripper = baxter_interface.Gripper(
+                args.side,
+                baxter_interface.CHECK_VERSION,
+            )
+            gripper_publisher = LatestGripperCommandPublisher(
+                gripper,
+                args.gripper_rate_hz,
+                args.gripper_deadband,
+                args.suction_trigger_press,
+                args.suction_trigger_release,
+            )
+        except Exception as exc:
+            raise SystemExit(
+                "Gripper preflight failed; no calibration/reset was attempted: "
+                "{}".format(exc)
+            ) from exc
     if args.ik_backend == "ros-service":
         service_name = (
             "/ExternalTools/{}/PositionKinematicsNode/IKService"
@@ -1453,6 +1641,7 @@ def main() -> None:
     latest_raw_controller: Optional[Vector3] = None
     latest_controller: Optional[Vector3] = None
     latest_grip = 0.0
+    latest_trigger = 0.0
     latest_sequence = -1
     latest_packet_age = float("inf")
 
@@ -1465,6 +1654,7 @@ def main() -> None:
     last_safety_report_time = 0.0
     consecutive_ik_misses = 0
     grip_session_id = 0
+    gripper_error_reported = False
     # 上一个完整且已接受的 IK 解，用作下一请求的 SEED_USER 和分支基准。
     last_successful_joint_command: Optional[JointDict] = None
 
@@ -1563,6 +1753,8 @@ def main() -> None:
         receiver.start()
         command_publisher.start()
         ik_worker.start()
+        if gripper_publisher is not None:
+            gripper_publisher.start()
 
         while not rospy.is_shutdown():
             now = time.monotonic()
@@ -1572,6 +1764,15 @@ def main() -> None:
             if publisher_error is not None:
                 clear_reference(publisher_error, safety_stop=True)
                 break
+
+            if gripper_publisher is not None and not gripper_error_reported:
+                gripper_error = gripper_publisher.error()
+                if gripper_error is not None:
+                    # Gripper failure is isolated from arm motion. The worker
+                    # stops issuing gripper commands, while Grip still remains
+                    # the arm dead-man switch.
+                    rospy.logerr("%s", gripper_error)
+                    gripper_error_reported = True
 
             if snapshot.serial != last_snapshot_serial:
                 last_snapshot_serial = snapshot.serial
@@ -1628,7 +1829,10 @@ def main() -> None:
                         # their packet timestamp still undergoes the age check.
                         is_new_sample = sequence != latest_sequence
                         latest_grip = controller_grip(packet, args.side)
+                        latest_trigger = controller_trigger(packet, args.side)
                         latest_packet_age = age
+                        if gripper_publisher is not None:
+                            gripper_publisher.set_trigger(latest_trigger)
 
                         if is_new_sample:
                             latest_raw_controller = list(current_controller)
@@ -2029,6 +2233,7 @@ def main() -> None:
                                 "seq": latest_sequence,
                                 "packet_age_ms": latest_packet_age * 1000.0,
                                 "grip": latest_grip,
+                                "trigger": latest_trigger,
                                 "loop_dt_ms": control_dt * 1000.0,
                                 "raw_hand_dx": raw_hand_delta[0],
                                 "raw_hand_dy": raw_hand_delta[1],
@@ -2158,6 +2363,8 @@ def main() -> None:
         except Exception as exc:
             rospy.logerr("Failed to issue final hold command: %s", exc)
         ik_worker.close()
+        if gripper_publisher is not None:
+            gripper_publisher.close()
         command_publisher.close()
         try:
             limb.set_joint_position_speed(DEFAULT_BAXTER_SPEED_RATIO)
