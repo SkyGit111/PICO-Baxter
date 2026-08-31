@@ -75,6 +75,28 @@ latest-only 夹爪发布线程：
 --enable-gripper
 ```
 
+## 控制日志分析
+
+为左右臂分别指定 CSV，避免两个进程写同一个文件：
+
+```bash
+--csv-log ~/pico_baxter_ws/logs/left-ros-service.csv
+```
+
+控制程序会记录成功 MOVE，以及 `IK_REJECT`、`IK_ERROR`、`IK_INVALID` 和
+`IK_BRANCH_REJECT`。测试结束后运行：
+
+```bash
+/usr/bin/python3 bridge/analyze_control_log.py \
+  ~/pico_baxter_ws/logs/left-ros-service.csv \
+  --json-output /tmp/left-ros-service-summary.json
+```
+
+分析器统计 IK 接受率、事件数量、packet age、控制周期、IK 求解/结果年龄、请求序列落后、
+末端和关节跟踪误差，并对明显超过默认验收阈值的项目给出提示。对比后端时必须保持同一侧、
+相近起始姿态、相同动作范围和参数，分别采集 `ros-service` 与 `pykdl` 日志；不要让两个进程
+写入同一个 CSV。
+
 ## 本次控制改进
 
 - Grip 锁定后必须检测到明确手部位移，才允许首次 IK 运动；

@@ -644,6 +644,7 @@ class CsvDiagnostics:
         "ik_alpha",
         "ik_diff_rad",
         "ik_code",
+        "ik_detail",
         "translation_saturated",
         "command_lead_saturated",
         "speed_saturated",
@@ -2083,6 +2084,26 @@ def main() -> None:
             ik_result = ik_worker.poll_result()
             accepted_result = False
             if ik_result is not None:
+                result_age_ms = (
+                    now - ik_result.request.submitted_monotonic
+                ) * 1000.0
+                worker_snapshot = ik_worker.snapshot()
+                ik_diagnostic = {
+                    "wall_time": time.time(),
+                    "seq": latest_sequence,
+                    "packet_age_ms": latest_packet_age * 1000.0,
+                    "grip": latest_grip,
+                    "trigger": latest_trigger,
+                    "loop_dt_ms": control_dt * 1000.0,
+                    "ik_backend": args.ik_backend,
+                    "ik_time_ms": ik_result.solve_time_ms,
+                    "ik_result_age_ms": result_age_ms,
+                    "ik_request_id": ik_result.request.request_id,
+                    "ik_request_seq": ik_result.request.sequence,
+                    "ik_replaced_pending": worker_snapshot.replaced_pending,
+                    "ik_alpha": ik_result.accepted_alpha,
+                    "ik_code": ik_result.result_code,
+                }
                 rejection = ik_result_rejection_reason(
                     ik_result,
                     grip_session_id,
@@ -2090,6 +2111,11 @@ def main() -> None:
                     args.max_ik_result_age,
                 )
                 if rejection is not None:
+                    diagnostics.write(dict(
+                        ik_diagnostic,
+                        event="IK_REJECT",
+                        ik_detail=rejection,
+                    ))
                     if ik_result.request.session_id == grip_session_id:
                         consecutive_ik_misses += 1
                         freeze_cartesian_target()
@@ -2104,6 +2130,11 @@ def main() -> None:
                         )
                         last_status_time = now
                 elif ik_result.error is not None:
+                    diagnostics.write(dict(
+                        ik_diagnostic,
+                        event="IK_ERROR",
+                        ik_detail=ik_result.error,
+                    ))
                     consecutive_ik_misses += 1
                     freeze_cartesian_target()
                     keep_previous_command()
@@ -2113,6 +2144,11 @@ def main() -> None:
                         ))
                         last_status_time = now
                 elif not ik_result.valid or ik_result.accepted_target is None:
+                    diagnostics.write(dict(
+                        ik_diagnostic,
+                        event="IK_INVALID",
+                        ik_detail="no reachable target",
+                    ))
                     consecutive_ik_misses += 1
                     freeze_cartesian_target()
                     keep_previous_command()
@@ -2176,6 +2212,14 @@ def main() -> None:
                         active_branch_limit > 0.0
                         and branch_difference > active_branch_limit
                     ):
+                        branch_row = dict(ik_diagnostic)
+                        branch_row.update({
+                            "event": "IK_BRANCH_REJECT",
+                            "ik_diff_rad": branch_difference,
+                            "joint_tracking_error_rad": joint_tracking_error,
+                            "ik_detail": "branch continuity limit exceeded",
+                        })
+                        diagnostics.write(branch_row)
                         consecutive_ik_misses += 1
                         freeze_cartesian_target()
                         keep_previous_command()
@@ -2222,10 +2266,6 @@ def main() -> None:
                                 ik_result.accepted_alpha,
                             )
 
-                        result_age_ms = (
-                            now - ik_result.request.submitted_monotonic
-                        ) * 1000.0
-                        worker_snapshot = ik_worker.snapshot()
                         diagnostics.write(
                             {
                                 "wall_time": time.time(),
