@@ -58,6 +58,9 @@ class RemoteVisionListener:
         send_buffer_bytes: int,
         allow_target_ip_mismatch: bool = False,
         sender_factory=DirectVideoSender,
+        max_send_ms: float = 250.0,
+        tcp_notsent_lowat_bytes: int = 4096,
+        dscp: int = 34,
     ) -> None:
         self.pipeline = pipeline
         self.listen_host = listen_host
@@ -68,6 +71,9 @@ class RemoteVisionListener:
         self.send_buffer_bytes = send_buffer_bytes
         self.allow_target_ip_mismatch = allow_target_ip_mismatch
         self.sender_factory = sender_factory
+        self.max_send_ms = max_send_ms
+        self.tcp_notsent_lowat_bytes = tcp_notsent_lowat_bytes
+        self.dscp = dscp
 
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
@@ -217,6 +223,9 @@ class RemoteVisionListener:
                 reconnect_delay=self.reconnect_delay,
                 send_buffer_bytes=self.send_buffer_bytes,
                 manage_pipeline=False,
+                max_send_ms=self.max_send_ms,
+                tcp_notsent_lowat_bytes=self.tcp_notsent_lowat_bytes,
+                dscp=self.dscp,
             )
             thread = threading.Thread(
                 target=self._run_video_sender,
@@ -255,6 +264,18 @@ class RemoteVisionListener:
                     raise RuntimeError(
                         "video worker did not stop within %.1f seconds" % join_timeout
                     )
+            if sender is not None:
+                LOG.info(
+                    "video stream summary: AUs=%d bytes=%d slow-sends=%d "
+                    "reconnects=%d gaps=%d keyframe-requests=%d max-send=%.1fms",
+                    getattr(sender, "frames_sent", 0),
+                    getattr(sender, "bytes_sent", 0),
+                    getattr(sender, "slow_sends", 0),
+                    getattr(sender, "reconnects", 0),
+                    getattr(sender, "discontinuities", 0),
+                    getattr(sender, "keyframe_requests", 0),
+                    getattr(sender, "maximum_send_ms", 0.0),
+                )
 
     def _close_control_socket(self) -> None:
         control = self._control_socket

@@ -15,9 +15,9 @@ class PipelineConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
-    bitrate_kbps: int = 10 * 1024
-    key_interval: int = 30
-    vbv_buffer_ms: int = 100
+    bitrate_kbps: int = 6 * 1024
+    key_interval: int = 15
+    vbv_buffer_ms: int = 50
     input_mode: str = "raw"
     source_format: Optional[str] = None
     test_source: bool = False
@@ -70,6 +70,8 @@ def build_pipeline_description(config: PipelineConfig) -> str:
             "sink_1::xpos=%d sink_1::ypos=0" % config.width,
             "! video/x-raw,width=%d,height=%d,framerate=%d/1"
             % (output_width, config.height, config.fps),
+            "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0",
+            "leaky=downstream",
             "! videoconvert",
             "! video/x-raw,format=I420",
             "! x264enc name=encoder tune=zerolatency speed-preset=ultrafast",
@@ -84,6 +86,8 @@ def build_pipeline_description(config: PipelineConfig) -> str:
             source,
             "! %s" % ",".join(input_caps),
             *decoder,
+            "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0",
+            "leaky=downstream",
             "! videoconvert",
             "! tee name=split",
             "split. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0",
@@ -103,6 +107,9 @@ class GstPipeline:
         self._gst = None
         self._pipeline = None
         self._sink = None
+        self._keyframe_event_pad = None
+        self.last_access_unit_age_ms: Optional[float] = None
+        self._force_key_unit_count = 0
 
     def start(self) -> None:
         if self._pipeline is not None:
@@ -114,9 +121,15 @@ class GstPipeline:
         _check_element_factories(Gst, self.config)
         pipeline = Gst.parse_launch(self.description)
         sink = pipeline.get_by_name("encoded_sink")
-        if sink is None:
+        encoder = pipeline.get_by_name("encoder")
+        keyframe_event_pad = (
+            None if encoder is None else encoder.get_static_pad("src")
+        )
+        if sink is None or keyframe_event_pad is None:
             pipeline.set_state(Gst.State.NULL)
-            raise RuntimeError("GStreamer pipeline has no encoded_sink")
+            raise RuntimeError(
+                "GStreamer pipeline is missing encoded_sink or encoder src pad"
+            )
 
         try:
             _set_playing_or_raise(Gst, pipeline)
@@ -127,6 +140,7 @@ class GstPipeline:
         self._gst = Gst
         self._pipeline = pipeline
         self._sink = sink
+        self._keyframe_event_pad = keyframe_event_pad
 
     def preflight(self) -> str:
         """Briefly run the pipeline to validate plugins and negotiated caps."""
@@ -155,6 +169,7 @@ class GstPipeline:
             return None
 
         buffer = sample.get_buffer()
+        self.last_access_unit_age_ms = self._calculate_buffer_age_ms(sample, buffer)
         success, mapping = buffer.map(self._gst.MapFlags.READ)
         if not success:
             raise RuntimeError("failed to map encoded GStreamer buffer")
@@ -165,6 +180,43 @@ class GstPipeline:
         is_keyframe = not buffer.has_flags(self._gst.BufferFlags.DELTA_UNIT)
         pts = None if buffer.pts == self._gst.CLOCK_TIME_NONE else int(buffer.pts)
         return payload, is_keyframe, pts
+
+    def request_keyframe(self) -> bool:
+        """Request an immediate IDR with headers from the running encoder."""
+        if self._keyframe_event_pad is None or self._gst is None:
+            return False
+        try:
+            import gi
+
+            gi.require_version("GstVideo", "1.0")
+            from gi.repository import GstVideo
+        except (ImportError, ValueError):
+            return False
+
+        self._force_key_unit_count += 1
+        event = GstVideo.video_event_new_upstream_force_key_unit(
+            self._gst.CLOCK_TIME_NONE,
+            True,
+            self._force_key_unit_count,
+        )
+        # Upstream events must be injected on a source pad. Sending this on
+        # appsink's sink pad is the wrong direction and is rejected by GstPad.
+        return bool(self._keyframe_event_pad.send_event(event))
+
+    def _calculate_buffer_age_ms(self, sample, buffer) -> Optional[float]:
+        if self._pipeline is None or self._gst is None:
+            return None
+        if buffer.pts == self._gst.CLOCK_TIME_NONE:
+            return None
+        clock = self._pipeline.get_clock()
+        if clock is None:
+            return None
+        segment = sample.get_segment()
+        running_pts = segment.to_running_time(self._gst.Format.TIME, buffer.pts)
+        if running_pts == self._gst.CLOCK_TIME_NONE:
+            return None
+        running_now = clock.get_time() - self._pipeline.get_base_time()
+        return max(0.0, (running_now - running_pts) / 1_000_000.0)
 
     def raise_on_bus_error(self) -> None:
         if self._pipeline is None or self._gst is None:
@@ -183,8 +235,10 @@ class GstPipeline:
         if self._pipeline is not None and self._gst is not None:
             self._pipeline.set_state(self._gst.State.NULL)
         self._sink = None
+        self._keyframe_event_pad = None
         self._pipeline = None
         self._gst = None
+        self.last_access_unit_age_ms = None
 
 
 def _load_gst():

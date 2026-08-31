@@ -156,6 +156,9 @@ class ListenerStateMachineTests(unittest.TestCase):
         self.assertTrue(first.started.wait(1.0))
         self.assertFalse(first.kwargs["manage_pipeline"])
         self.assertIs(first.kwargs["pipeline"], self.pipeline)
+        self.assertEqual(first.kwargs["max_send_ms"], 250.0)
+        self.assertEqual(first.kwargs["tcp_notsent_lowat_bytes"], 4096)
+        self.assertEqual(first.kwargs["dscp"], 34)
 
         self.control.sendall(control_frame("OPEN_CAMERA", camera_request(port=12346)))
         self.assertTrue(wait_until(lambda: len(FakeSender.instances) == 2))

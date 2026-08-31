@@ -12,7 +12,7 @@ RGB 设备，将 1280×720 图像横向复制为 2560×720 SBS，再进行低延
 
 ```bash
 sudo apt install \
-  python3-gi gir1.2-gstreamer-1.0 \
+  python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
   gstreamer1.0-tools gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav v4l-utils ffmpeg
@@ -64,16 +64,21 @@ D455_DEVICE='/dev/v4l/by-id/替换为实际的D455-RGB节点'
 
 - 输入：1280×720、30 FPS；
 - 输出：2560×720 SBS；
-- 码率：10 Mbps；
+- 码率：6 Mbps；
 - H.264 Baseline、Annex-B、按完整 AU 输出；
 - `zerolatency`、`ultrafast`、`bframes=0`；
-- 1 个参考帧，无前向预测，100 ms VBV；
-- 关键帧间隔 30 帧；
-- 分支队列和 appsink 最多保留 1 个 buffer，旧帧及时丢弃。
+- 1 个参考帧，无前向预测，50 ms VBV；
+- 关键帧间隔 15 帧；
+- 采集、SBS 合成、编码分支和 appsink 队列最多保留 1 个 buffer，旧帧及时丢弃；
+- TCP 发送缓冲请求值 16 KiB，Linux `TCP_NOTSENT_LOWAT` 请求值 4 KiB；
+- 单个 AU 发送超时和慢写上限均为 250 ms，超过上限即断开并重新建立视频流；
+- 视频 socket 默认标记 DSCP AF41；网络设备不支持或忽略 DSCP 时不影响兼容性。
 
 发送端会检测丢帧造成的时间戳断层，并暂停发送依赖帧，直到下一个 IDR。TCP
 写入设置了超时；发生超时或部分发送后会丢弃当前连接并重新建立，不会继续复用
-已经失去帧边界的字节流。
+已经失去帧边界的字节流。新连接和时间戳断层会主动向编码器请求 IDR；15 帧的
+固定 GOP 是请求不被运行环境支持时的恢复后备机制。运行日志每 5 秒报告
+`pipeline-age`、当前/最大 AU 发送耗时、`slow-sends`、`reconnects` 和 `gaps`。
 
 每个 H.264 AU 的 TCP 格式为：
 
@@ -153,4 +158,5 @@ bash scripts/test_vision_local.sh
 ```
 
 真实 PICO、D455、CPU 负载、Wi-Fi 和端到端显示延迟必须在机器人主机与实验室
-网络中验证。完整步骤参见 [`TESTING.md`](TESTING.md)。
+网络中验证。完整步骤参见 [`TESTING.md`](TESTING.md)，延迟诊断与降载方案参见
+[`LATENCY_TUNING.md`](LATENCY_TUNING.md)。

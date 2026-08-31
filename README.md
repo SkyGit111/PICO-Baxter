@@ -43,6 +43,7 @@ XR PC Service、Baxter SDK 或 Baxter 遥操作桥。
 D455 初始输入为 1280×720、30 FPS，发送前将同一 RGB 图像横向复制为
 2560×720 SBS。依赖、运行参数和测试流程参见
 [`vision/README.md`](vision/README.md) 与
-[`vision/TESTING.md`](vision/TESTING.md)。
+[`vision/TESTING.md`](vision/TESTING.md)。延迟日志判读和分级降载配置参见
+[`vision/LATENCY_TUNING.md`](vision/LATENCY_TUNING.md)。
 
 导入的上游版本记录参见 [`UPSTREAM_VERSIONS.md`](UPSTREAM_VERSIONS.md)。

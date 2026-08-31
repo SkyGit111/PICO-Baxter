@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--bitrate-mbps", type=float, default=10.0)
+    parser.add_argument("--bitrate-mbps", type=float, default=6.0)
     parser.add_argument("--test-source", action="store_true")
     parser.add_argument(
         "--list-only",

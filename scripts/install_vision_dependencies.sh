@@ -23,7 +23,7 @@ if [[ ! -x "$vision_python" ]]; then
   echo "Override it with VISION_PYTHON=/path/to/python if required." >&2
   exit 1
 fi
-if ! "$vision_python" -c 'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst' 2>/dev/null; then
+if ! "$vision_python" -c 'import gi; gi.require_version("Gst", "1.0"); gi.require_version("GstVideo", "1.0"); from gi.repository import Gst, GstVideo' 2>/dev/null; then
   echo "GStreamer GI is unavailable in $vision_python." >&2
   echo "Ubuntu's python3-gi normally requires VISION_PYTHON=/usr/bin/python3." >&2
   exit 1

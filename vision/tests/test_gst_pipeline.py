@@ -1,4 +1,7 @@
 import unittest
+import sys
+import types
+from unittest import mock
 
 from vision.gst_pipeline import (
     PipelineConfig,
@@ -6,6 +9,7 @@ from vision.gst_pipeline import (
     _set_playing_or_raise,
     build_pipeline_description,
     required_elements,
+    GstPipeline,
 )
 
 
@@ -23,11 +27,14 @@ class PipelineDescriptionTests(unittest.TestCase):
         self.assertIn("bframes=0", description)
         self.assertIn("rc-lookahead=0", description)
         self.assertIn("sync-lookahead=0", description)
-        self.assertIn("vbv-buf-capacity=100", description)
+        self.assertIn("vbv-buf-capacity=50", description)
+        self.assertIn("key-int-max=15", description)
+        self.assertIn("bitrate=6144", description)
         self.assertIn("ref=1", description)
         self.assertIn("alignment=au", description)
         self.assertIn("profile=baseline", description)
         self.assertIn("max-buffers=1 drop=true", description)
+        self.assertGreaterEqual(description.count("leaky=downstream"), 4)
         self.assertEqual(description.count("v4l2src"), 1)
 
     def test_test_source_does_not_open_v4l2(self):
@@ -42,7 +49,8 @@ class PipelineDescriptionTests(unittest.TestCase):
             PipelineConfig(device="/dev/d455", input_mode="mjpeg")
         )
         self.assertIn("image/jpeg,width=1280,height=720", description)
-        self.assertIn("! jpegdec ! videoconvert", description)
+        self.assertIn("! jpegdec ! queue", description)
+        self.assertIn("leaky=downstream ! videoconvert", description)
 
     def test_mjpeg_rejects_raw_source_format(self):
         with self.assertRaises(ValueError):
@@ -137,6 +145,76 @@ class PipelineStartupTests(unittest.TestCase):
         pipeline = self.Pipeline(self.Return.FAILURE, self.Return.SUCCESS)
         with self.assertRaisesRegex(RuntimeError, "failed to enter PLAYING"):
             _set_playing_or_raise(self.Gst, pipeline)
+
+
+class PipelineFreshnessTests(unittest.TestCase):
+    def test_buffer_age_uses_pipeline_running_time(self):
+        pipeline = GstPipeline(PipelineConfig(device="", test_source=True))
+
+        class Gst:
+            CLOCK_TIME_NONE = -1
+
+            class Format:
+                TIME = "time"
+
+        class Clock:
+            @staticmethod
+            def get_time():
+                return 2_000_000_000
+
+        class RunningPipeline:
+            @staticmethod
+            def get_clock():
+                return Clock()
+
+            @staticmethod
+            def get_base_time():
+                return 1_000_000_000
+
+        class Segment:
+            @staticmethod
+            def to_running_time(_format, pts):
+                return pts
+
+        class Sample:
+            @staticmethod
+            def get_segment():
+                return Segment()
+
+        pipeline._gst = Gst
+        pipeline._pipeline = RunningPipeline()
+        age = pipeline._calculate_buffer_age_ms(
+            Sample(), types.SimpleNamespace(pts=900_000_000)
+        )
+        self.assertAlmostEqual(age, 100.0)
+
+    def test_keyframe_request_is_sent_upstream_from_encoder_source_pad(self):
+        pipeline = GstPipeline(PipelineConfig(device="", test_source=True))
+        events = []
+
+        class EncoderSourcePad:
+            @staticmethod
+            def send_event(event):
+                events.append(event)
+                return True
+
+        class GstVideo:
+            @staticmethod
+            def video_event_new_upstream_force_key_unit(running_time, headers, count):
+                return running_time, headers, count
+
+        fake_gi = types.ModuleType("gi")
+        fake_gi.require_version = lambda *_args: None
+        fake_repository = types.ModuleType("gi.repository")
+        fake_repository.GstVideo = GstVideo
+        pipeline._gst = types.SimpleNamespace(CLOCK_TIME_NONE=-1)
+        pipeline._keyframe_event_pad = EncoderSourcePad()
+        with mock.patch.dict(
+            sys.modules,
+            {"gi": fake_gi, "gi.repository": fake_repository},
+        ):
+            self.assertTrue(pipeline.request_keyframe())
+        self.assertEqual(events, [(-1, True, 1)])
 
 
 if __name__ == "__main__":
